@@ -28,33 +28,27 @@ jobs:
           SH="busybox sh" BB_PATH=/tmp/bb UBINIZE=real sh tests/run.sh
           ls -l tests/out-recovery.ubi
 
-      - name: UBI image on a simulated 128 MiB SPI-NAND
+      # The runner kernel has no nandsim, so the image is parsed in userspace:
+      # 128 KiB PEB, 2 KiB page without sub-pages (VID header at 2048, LEB
+      # 126976), one dynamic volume "recovery" with id 2 holding the initramfs.
+      - name: Validate the real UBI image
         run: |
-          sudo apt-get install -y "linux-modules-extra-$(uname -r)"
-          # 128 MiB, page 2 KiB, block 128 KiB: mtd0 = bl2..fip (44 blocks), mtd1 = ubi (980)
-          sudo modprobe nandsim id_bytes=0xec,0xf1,0x00,0x15 parts=44,980
-          sudo modprobe ubi
-          cat /proc/mtd
-          # SPI-NAND has no sub-page writes, so UBI puts the VID header at 2048
-          sudo ubiformat /dev/mtd1 -y -O 2048 -f tests/out-recovery.ubi
-          sudo ubiattach -m 1 -O 2048 -d 0
-          ubinfo -d 0 | tee dev.txt
-          grep -q 'Logical eraseblock size: *126976 bytes' dev.txt
-          grep -q 'Total amount of logical eraseblocks: *980 ' dev.txt
-          ubinfo -d 0 -N recovery | tee vol.txt
-          grep -q '^Volume ID: *2 ' vol.txt
-          grep -q '^Type: *dynamic' vol.txt
-          grep -q '^Name: *recovery' vol.txt
-          sudo head -c 9306112 /dev/ubi0_2 | sha256sum | tee sum.txt
+          pip install --quiet ubi_reader
+          ubireader_display_info tests/out-recovery.ubi | tee info.txt
+          grep -q 'PEB Size: 131072' info.txt
+          grep -q 'LEB Size: 126976' info.txt
+          grep -q 'Min I/O: 2048' info.txt
+          grep -q 'Vol ID: 2' info.txt
+          grep -q 'vol_type: dynamic' info.txt
+          grep -q 'reserved_pebs: 74' info.txt
+          grep -q 'name: recovery' info.txt
+          ! grep -E 'errors: \[.+\]' info.txt
+          ubireader_extract_images -o ubi-out tests/out-recovery.ubi
+          vol=$(find ubi-out -type f -name '*recovery*')
+          head -c 9306112 "$vol" | sha256sum | tee sum.txt
           grep -q '^8ceee0b72589da501ee7e9e34628491a385a6b2f2cf87fec005b1af29cd843b3 ' sum.txt
-          # U-Boot on first boot creates the env volumes; they must get ids 0 and 1
-          sudo ubimkvol /dev/ubi0 -N ubootenv -s 1MiB
-          sudo ubimkvol /dev/ubi0 -N ubootenv2 -s 1MiB
-          ubinfo -d 0 -N ubootenv | grep -q '^Volume ID: *0 '
-          ubinfo -d 0 -N ubootenv2 | grep -q '^Volume ID: *1 '
-          # sysupgrade from the initramfs: fit + rootfs_data, recovery stays
-          sudo ubimkvol /dev/ubi0 -N fit -s 15335694
-          sudo ubiupdatevol /dev/ubi0_3 firmware/openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-argon-ru-squashfs-sysupgrade.itb
-          sudo ubimkvol /dev/ubi0 -N rootfs_data -m
-          ubinfo -d 0 -a | grep -E '^(Volume ID|Name|Size):'
-          sudo ubidetach -m 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recovery-ubi
+          path: tests/out-recovery.ubi
