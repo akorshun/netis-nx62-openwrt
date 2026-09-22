@@ -244,8 +244,9 @@ FAIL_REPO=1 run_flash mirror "$T/r3" -y
 # 4. Без -y и без терминала: вопрос задать нельзя, ничего не пишется
 make_router "$T/r4" 0x7a80000
 run_flash notty "$T/r4"
-[ "$(cat "$T/notty/rc")" = 1 ] && [ ! -e "$T/notty/log/mtd.log" ] && [ ! -e "$T/notty/log/sysupgrade.log" ] &&
-	pass "notty: остановка до записи" || fail "notty: rc=$(cat "$T/notty/rc")"
+[ "$(cat "$T/notty/rc")" = 1 ] && grep -q 'добавьте -y' "$T/notty/out" &&
+	[ ! -e "$T/notty/log/mtd.log" ] && [ ! -e "$T/notty/log/sysupgrade.log" ] &&
+	pass "notty: остановка до записи с подсказкой про -y" || fail "notty: rc=$(cat "$T/notty/rc"): $(tail -n 2 "$T/notty/out")"
 
 # 5. Разметка стоковая / NMBM (ubi 0x7280000) — отказ
 make_router "$T/r5" 0x7280000

@@ -229,8 +229,10 @@ confirm() {
 	local answer
 
 	[ "$AUTO_YES" = 1 ] && return 0
-	{ : < /dev/tty; } 2>/dev/null ||
+	# В subshell: ошибка перенаправления у «:» в ash/dash завершает весь shell
+	if ! (: < /dev/tty) 2>/dev/null; then
 		die "не могу задать вопрос: запустите скрипт в интерактивной SSH-сессии или добавьте -y (… | sh -s -- -y)"
+	fi
 
 	printf '%s [y/N]: ' "$1"
 	read -r answer < /dev/tty || answer=""
