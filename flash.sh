@@ -116,13 +116,15 @@ check_layout() {
 		[ -n "$idx" ] || die "в /proc/mtd нет раздела '$name'"
 		real_off=$(mtd_attr "$idx" offset)
 		real_size=$(mtd_attr "$idx" size)
-		[ "$real_off" = "$off" ] && [ "$real_size" = "$size" ] ||
+		if [ "$real_off" != "$off" ] || [ "$real_size" != "$size" ]; then
 			die "раздел $name: смещение $real_off, размер $real_size, ожидалось $off и $size. Скрипт только для стандартной версии на 128 МБ с разметкой официальной OpenWrt"
+		fi
 	done
 
 	idx=$(mtd_index ubi)
-	[ "$(mtd_attr "$idx" erasesize)" = 131072 ] && [ "$(mtd_attr "$idx" writesize)" = 2048 ] ||
+	if [ "$(mtd_attr "$idx" erasesize)" != 131072 ] || [ "$(mtd_attr "$idx" writesize)" != 2048 ]; then
 		die "NAND с блоком $(mtd_attr "$idx" erasesize) и страницей $(mtd_attr "$idx" writesize) байт: это не стандартная версия (128 КБ / 2 КБ)"
+	fi
 
 	for name in bl2 fip; do
 		[ "$(mtd_attr "$(mtd_index "$name")" bad_blocks)" = 0 ] ||
