@@ -1,0 +1,60 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install busybox and mtd-utils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y busybox mtd-utils
+
+      - name: shellcheck
+        run: shellcheck flash.sh tests/run.sh
+
+      - name: Scenarios (dash + coreutils)
+        run: sh tests/run.sh
+
+      - name: Scenarios (busybox ash + busybox applets, real ubinize)
+        run: |
+          mkdir -p /tmp/bb
+          busybox --install -s /tmp/bb
+          SH="busybox sh" BB_PATH=/tmp/bb UBINIZE=real sh tests/run.sh
+          ls -l tests/out-recovery.ubi
+
+      - name: UBI image on a simulated 128 MiB SPI-NAND
+        run: |
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+          # 128 MiB, page 2 KiB, block 128 KiB: mtd0 = bl2..fip (44 blocks), mtd1 = ubi (980)
+          sudo modprobe nandsim id_bytes=0xec,0xf1,0x00,0x15 parts=44,980
+          sudo modprobe ubi
+          cat /proc/mtd
+          # SPI-NAND has no sub-page writes, so UBI puts the VID header at 2048
+          sudo ubiformat /dev/mtd1 -y -O 2048 -f tests/out-recovery.ubi
+          sudo ubiattach -m 1 -O 2048 -d 0
+          ubinfo -d 0 | tee dev.txt
+          grep -q 'Logical eraseblock size: *126976 bytes' dev.txt
+          grep -q 'Total amount of logical eraseblocks: *980 ' dev.txt
+          ubinfo -d 0 -N recovery | tee vol.txt
+          grep -q '^Volume ID: *2 ' vol.txt
+          grep -q '^Type: *dynamic' vol.txt
+          grep -q '^Name: *recovery' vol.txt
+          sudo head -c 9306112 /dev/ubi0_2 | sha256sum | tee sum.txt
+          grep -q '^8ceee0b72589da501ee7e9e34628491a385a6b2f2cf87fec005b1af29cd843b3 ' sum.txt
+          # U-Boot on first boot creates the env volumes; they must get ids 0 and 1
+          sudo ubimkvol /dev/ubi0 -N ubootenv -s 1MiB
+          sudo ubimkvol /dev/ubi0 -N ubootenv2 -s 1MiB
+          ubinfo -d 0 -N ubootenv | grep -q '^Volume ID: *0 '
+          ubinfo -d 0 -N ubootenv2 | grep -q '^Volume ID: *1 '
+          # sysupgrade from the initramfs: fit + rootfs_data, recovery stays
+          sudo ubimkvol /dev/ubi0 -N fit -s 15335694
+          sudo ubiupdatevol /dev/ubi0_3 firmware/openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-argon-ru-squashfs-sysupgrade.itb
+          sudo ubimkvol /dev/ubi0 -N rootfs_data -m
+          ubinfo -d 0 -a | grep -E '^(Volume ID|Name|Size):'
+          sudo ubidetach -m 1
