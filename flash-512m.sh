@@ -90,7 +90,9 @@ flash_size_mib() {
 		resv=$(cat "$ubi/reserved_for_bad" 2>/dev/null)
 		bad=$(cat "$ubi/bad_peb_count" 2>/dev/null)
 		es=$(mtd_attr "$(mtd_index ubi)" erasesize)
-		[ -n "$resv" ] && [ -n "$bad" ] && [ -n "$es" ] || continue
+		if [ -z "$resv" ] || [ -z "$bad" ] || [ -z "$es" ]; then
+			continue
+		fi
 		echo $(( (resv + bad) * es / 20480 ))
 		return 0
 	done
