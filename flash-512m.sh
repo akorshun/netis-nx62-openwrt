@@ -1,41 +1,42 @@
 #!/bin/sh
 # shellcheck shell=dash
 #
-# Netis NX62 / Netcore N60 Pro (MT7986A, 128 МБ SPI-NAND).
+# Netis NX62 / Netcore N60 Pro, версия с 512 МБ ROM (MT7986A, SPI-NAND
+# со страницей 4 КБ и блоком 256 КБ).
 #
-# Записывает официальный загрузчик OpenWrt 25.12.5 (preloader в bl2, BL31 +
-# U-Boot в fip), форматирует раздел ubi целиком с initramfs 25.12.5 в томе
-# recovery и перезагружает роутер: U-Boot сам запускает initramfs из NAND.
+# Записывает кастомный загрузчик U-Boot 2025.07-WildEdition (BL2 в bl2,
+# BL31 + U-Boot в fip), стирает u-boot-env и ubi и перезагружает роутер:
+# U-Boot не находит прошивку и сам открывает веб-интерфейс с DHCP.
 #
-#   wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash.sh | sh
-#   wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash.sh | sh -s -- -y
+#   wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash-512m.sh | sh
+#   wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash-512m.sh | sh -s -- -y
 #
 # https://github.com/akorshun/netis-nx62-openwrt
 
 REPO_URL="https://github.com/akorshun/netis-nx62-openwrt"
-REPO_RAW="https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/firmware"
-OWRT_URL="https://downloads.openwrt.org/releases/25.12.5/targets/mediatek/filogic"
-BOARD="netcore,n60-pro"
+REPO_RAW="https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/firmware/512m"
+REPO_CDN="https://cdn.jsdelivr.net/gh/akorshun/netis-nx62-openwrt@main/firmware/512m"
 
-BL2_FILE="openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-preloader.bin"
-BL2_SHA256="4215ec48f52b26ce0d93c2f67d4e435d6372c2701b9574b59d2ed51aaef0acf2"
-FIP_FILE="openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-bl31-uboot.fip"
-FIP_SHA256="1d5c3cbac086bf69598a374f8098776a1843384b014dda79f4673d8e4d7d645a"
-RECOVERY_FILE="openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-initramfs-recovery.itb"
-RECOVERY_SHA256="8ceee0b72589da501ee7e9e34628491a385a6b2f2cf87fec005b1af29cd843b3"
+BL2_FILE="netcore_n60-pro-512m-wildedition-bl2.bin"
+BL2_SHA256="9b958b6ff922f55aa20dcf81afc5052152c020a5b0fc9ca50d7fd246cd560388"
+FIP_FILE="netcore_n60-pro-512m-wildedition-fip.bin"
+FIP_SHA256="e4d87f39ebc01f5b5cf8428adc000cb327424f7b223622782bb876d1ebf34aed"
 
-# Разметка официального DTS 25.12.5: смещение и размер в байтах.
-# ubi занимает всё до конца 128 МБ флешки, без NMBM.
+# Адрес из окружения U-Boot по умолчанию; u-boot-env скрипт стирает
+UBOOT_IP="10.10.10.1"
+
+# Начало NAND одинаково во всех раскладках U-Boot: смещение и размер в байтах.
+# Раздел ubi у текущей прошивки может быть любым, лишь бы начинался с 5,5 МБ.
 LAYOUT="bl2:0:1048576 u-boot-env:1048576:524288 factory:1572864:2097152
-fip:3670016:2097152 ubi:5767168:128450560"
+fip:3670016:2097152"
+UBI_OFFSET=5767168
+FLASH_SIZE=536870912
 
 # Только для тестов: корень с подменёнными /proc, /sys, /dev и т. п.
 ROOT="${NX62_ROOT:-}"
-WORKDIR="${NX62_WORKDIR:-/tmp/nx62-flash}"
-UBI_IMAGE="$WORKDIR/recovery.ubi"
+WORKDIR="${NX62_WORKDIR:-/tmp/nx62-flash-512m}"
 
 AUTO_YES=0
-NEED_UBI_UTILS=0
 NEED_BL2=1
 NEED_FIP=1
 
@@ -92,9 +93,14 @@ check_system() {
 		die "скрипт запускается на роутере с OpenWrt"
 
 	board=$(cat "$ROOT/tmp/sysinfo/board_name" 2>/dev/null)
-	[ "$board" = "$BOARD" ] ||
-		die "модель '$board', а нужна '$BOARD' (Netis NX62 / Netcore N60 Pro)"
-	ok "модель: $board"
+	case "$board" in
+	netcore,n60-pro*|netis,nx62*)
+		ok "модель: $board"
+		;;
+	*)
+		die "модель '$board', а нужна Netis NX62 / Netcore N60 Pro"
+		;;
+	esac
 
 	release=$(sed -n "s/^DISTRIB_DESCRIPTION='\(.*\)'\$/\1/p" "$ROOT/etc/openwrt_release")
 	ok "прошивка: ${release:-неизвестно}"
@@ -109,13 +115,13 @@ check_layout() {
 	idx=$(mtd_index fip)
 	[ -n "$idx" ] || die "в /proc/mtd нет раздела 'fip'"
 	case "$(mtd_attr "$idx" erasesize)/$(mtd_attr "$idx" writesize)" in
-	131072/2048)
-		;;
 	262144/4096)
-		die "это версия с 512 МБ ROM (блок 256 КБ, страница 4 КБ). Для неё: wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash-512m.sh | sh"
+		;;
+	131072/2048)
+		die "это стандартная версия на 128 МБ (блок 128 КБ, страница 2 КБ). Для неё: wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash.sh | sh"
 		;;
 	*)
-		die "NAND с блоком $(mtd_attr "$idx" erasesize) и страницей $(mtd_attr "$idx" writesize) байт: это не стандартная версия (128 КБ / 2 КБ)"
+		die "NAND с блоком $(mtd_attr "$idx" erasesize) и страницей $(mtd_attr "$idx" writesize) байт: это не версия на 512 МБ (256 КБ / 4 КБ)"
 		;;
 	esac
 
@@ -130,30 +136,32 @@ check_layout() {
 		real_off=$(mtd_attr "$idx" offset)
 		real_size=$(mtd_attr "$idx" size)
 		if [ "$real_off" != "$off" ] || [ "$real_size" != "$size" ]; then
-			die "раздел $name: смещение $real_off, размер $real_size, ожидалось $off и $size. Скрипт только для стандартной версии на 128 МБ с разметкой официальной OpenWrt"
+			die "раздел $name: смещение $real_off, размер $real_size, ожидалось $off и $size"
 		fi
 	done
+
+	idx=$(mtd_index ubi)
+	[ -n "$idx" ] || die "в /proc/mtd нет раздела 'ubi'"
+	real_off=$(mtd_attr "$idx" offset)
+	real_size=$(mtd_attr "$idx" size)
+	if [ "$real_off" != "$UBI_OFFSET" ] ||
+	   [ $(( real_off + real_size )) -gt "$FLASH_SIZE" ]; then
+		die "раздел ubi: смещение $real_off, размер $real_size — не похоже на NAND 512 МБ"
+	fi
 
 	for name in bl2 fip; do
 		[ "$(mtd_attr "$(mtd_index "$name")" bad_blocks)" = 0 ] ||
 			die "в разделе $name есть bad-блоки или ядро не сообщает их число — прошивать загрузчик так нельзя"
 	done
-	ok "разметка NAND: 128 МБ, bl2/fip без bad-блоков"
+	ok "NAND 512 МБ (блок 256 КБ, страница 4 КБ), bl2/fip без bad-блоков"
 }
 
 check_tools() {
 	local tool
 
-	for tool in mtd sysupgrade sha256sum wget head; do
+	for tool in mtd sha256sum wget head; do
 		command -v "$tool" >/dev/null 2>&1 || die "нет утилиты $tool"
 	done
-	command -v ubinize >/dev/null 2>&1 || NEED_UBI_UTILS=1
-
-	grep -q '^nand_upgrade_ubinized()' "$ROOT/lib/upgrade/nand.sh" 2>/dev/null ||
-		die "sysupgrade этой прошивки не умеет записывать UBI-образы"
-	grep -q "$BOARD" "$ROOT/lib/upgrade/platform.sh" 2>/dev/null ||
-		die "sysupgrade этой прошивки не знает $BOARD"
-	ok "sysupgrade поддерживает UBI-образы"
 }
 
 prepare_workdir() {
@@ -161,8 +169,8 @@ prepare_workdir() {
 
 	mkdir -p "$WORKDIR" || die "не удалось создать $WORKDIR"
 	free_kb=$(df -Pk "$WORKDIR" | awk 'NR == 2 { print $4 }')
-	[ "${free_kb:-0}" -ge 40960 ] ||
-		die "в $WORKDIR свободно $(( ${free_kb:-0} / 1024 )) МБ, нужно 40 МБ"
+	[ "${free_kb:-0}" -ge 16384 ] ||
+		die "в $WORKDIR свободно $(( ${free_kb:-0} / 1024 )) МБ, нужно 16 МБ"
 }
 
 fetch() { # <файл> <sha256>
@@ -173,7 +181,7 @@ fetch() { # <файл> <sha256>
 		return 0
 	fi
 
-	for url in "$REPO_RAW/$file" "$OWRT_URL/$file"; do
+	for url in "$REPO_RAW/$file" "$REPO_CDN/$file"; do
 		rm -f "$dst"
 		if wget -q -T 30 --no-check-certificate -O "$dst" "$url" 2>/dev/null &&
 		   [ -f "$dst" ] && [ "$(sha256_of "$dst")" = "$sum" ]; then
@@ -215,17 +223,18 @@ summary() {
 	echo
 	info "Что будет сделано"
 	if [ "$NEED_BL2" = 1 ]; then
-		echo "  • bl2 ← preloader OpenWrt 25.12.5"
+		echo "  • bl2 ← BL2 WildEdition для NAND 512 МБ"
 	else
-		echo "  • bl2: preloader 25.12.5 уже записан, пропуск"
+		echo "  • bl2: BL2 WildEdition уже записан, пропуск"
 	fi
 	if [ "$NEED_FIP" = 1 ]; then
-		echo "  • fip ← BL31 + U-Boot OpenWrt 25.12.5"
+		echo "  • fip ← BL31 + U-Boot 2025.07-WildEdition"
 	else
-		echo "  • fip: BL31 + U-Boot 25.12.5 уже записан, пропуск"
+		echo "  • fip: U-Boot WildEdition уже записан, пропуск"
 	fi
-	echo "  • ubi ← форматирование целиком, initramfs 25.12.5 в томе recovery"
-	echo "  • перезагрузка в initramfs (192.168.1.1)"
+	echo "  • u-boot-env ← стирание: U-Boot запустится с настройками по умолчанию"
+	echo "  • ubi ← стирание, затем перезагрузка в веб-интерфейс U-Boot"
+	echo "    http://$UBOOT_IP (адрес ПК по DHCP)"
 	echo
 	warn "текущая прошивка и все её настройки будут удалены"
 	echo "  Бэкап лежит в $WORKDIR/backup, пока роутер не перезагружен."
@@ -269,42 +278,12 @@ pkg_install() {
 	return 1
 }
 
-build_ubi_image() {
-	local idx peb page subpage
-
-	if [ "$NEED_UBI_UTILS" = 1 ]; then
-		pkg_install ubi-utils || die "не удалось установить ubi-utils"
-		command -v ubinize >/dev/null 2>&1 || die "после установки ubi-utils нет ubinize"
-	fi
-
-	idx=$(mtd_index ubi)
-	peb=$(mtd_attr "$idx" erasesize)
-	page=$(mtd_attr "$idx" writesize)
-	subpage=$(mtd_attr "$idx" subpagesize)
-
-	# vol_id 2: тома ubootenv и ubootenv2 U-Boot при первом запуске создаст
-	# сам под номерами 0 и 1, как при штатной установке через TFTP.
-	cat > "$WORKDIR/ubinize.cfg" <<-EOF
-		[recovery]
-		mode=ubi
-		vol_id=2
-		vol_type=dynamic
-		vol_name=recovery
-		image=$WORKDIR/$RECOVERY_FILE
-	EOF
-
-	rm -f "$UBI_IMAGE"
-	if ! ubinize -o "$UBI_IMAGE" -p "$peb" -m "$page" -s "${subpage:-$page}" \
-			"$WORKDIR/ubinize.cfg" > "$WORKDIR/ubinize.log" 2>&1; then
-		cat "$WORKDIR/ubinize.log" >&2
-		die "ubinize завершился с ошибкой"
-	fi
-	[ "$(head -c 4 "$UBI_IMAGE")" = "UBI#" ] || die "ubinize собрал некорректный образ"
-	ok "UBI-образ с томом recovery: $(( $(file_size "$UBI_IMAGE") / 1024 )) КБ"
+all_writable() {
+	part_writable bl2 && part_writable fip && part_writable u-boot-env && part_writable ubi
 }
 
 enable_mtd_write() {
-	part_writable bl2 && part_writable fip && return 0
+	all_writable && return 0
 
 	if ! grep -q '^mtd_rw ' "$ROOT/proc/modules" 2>/dev/null; then
 		if [ -z "$(find "$ROOT/lib/modules/" -name mtd-rw.ko 2>/dev/null)" ]; then
@@ -315,10 +294,10 @@ enable_mtd_write() {
 			die "не удалось загрузить модуль mtd-rw"
 	fi
 
-	if ! part_writable bl2 || ! part_writable fip; then
-		die "разделы bl2 и fip по-прежнему только для чтения"
+	if ! all_writable; then
+		die "разделы bl2, fip, u-boot-env или ubi по-прежнему только для чтения"
 	fi
-	ok "запись в bl2 и fip разрешена (kmod-mtd-rw)"
+	ok "запись в разделы разрешена (kmod-mtd-rw)"
 }
 
 write_part() { # <раздел> <файл> <sha256>
@@ -343,18 +322,17 @@ write_part() { # <раздел> <файл> <sha256>
 next_steps() {
 	echo
 	echo "=================================================================="
-	ok "Загрузчик OpenWrt 25.12.5 на месте."
-	echo "  Сейчас sysupgrade отформатирует ubi, положит initramfs в том"
-	echo "  recovery и перезагрузит роутер. Сообщения «Image check failed» и"
-	echo "  «metadata not present» ожидаемы: это UBI-образ, он пишется с -F."
+	ok "Загрузчик U-Boot WildEdition на месте."
+	echo "  Сейчас роутер сотрёт раздел ubi и перезагрузится. U-Boot не найдёт"
+	echo "  прошивку и сам откроет веб-интерфейс."
 	echo
-	echo "  Через 1–2 минуты:"
-	echo "   1. ПК кабелем в LAN (адрес по DHCP), http://192.168.1.1"
-	echo "      или ssh root@192.168.1.1 — пароля нет."
-	echo "   2. Прошейте sysupgrade без сохранения настроек:"
-	echo "      LuCI: System → Backup / Flash Firmware → Flash image…"
-	echo "      терминал: sysupgrade -n /tmp/<файл>-sysupgrade.itb"
-	echo "   mtd erase ubi делать не нужно."
+	echo "  Через полминуты:"
+	echo "   1. ПК кабелем в LAN, адрес по DHCP (10.10.10.x)."
+	echo "   2. Откройте http://$UBOOT_IP"
+	echo "   3. Выберите раскладку NAND и загрузите прошивку."
+	echo
+	echo "  Если страница не открывается: выключите роутер, зажмите reset,"
+	echo "  включите и держите кнопку 4–5 секунд, пока не загорится индикатор."
 	echo
 	echo "  Инструкция: $REPO_URL"
 	echo "=================================================================="
@@ -363,7 +341,7 @@ next_steps() {
 
 usage() {
 	cat <<-EOF
-		Использование: flash.sh [-y]
+		Использование: flash-512m.sh [-y]
 		  -y, --yes   не задавать вопросов
 		Подробно: $REPO_URL
 	EOF
@@ -387,17 +365,16 @@ main() {
 		shift
 	done
 
-	info "Netis NX62 / Netcore N60 Pro: загрузчик OpenWrt 25.12.5 + initramfs"
+	info "Netis NX62 / Netcore N60 Pro 512 МБ ROM: загрузчик U-Boot WildEdition"
 	echo
 	check_system
 	check_layout
 	check_tools
 	prepare_workdir
 
-	info "Загрузка образов OpenWrt 25.12.5"
+	info "Загрузка BL2 и U-Boot"
 	fetch "$BL2_FILE" "$BL2_SHA256"
 	fetch "$FIP_FILE" "$FIP_SHA256"
-	fetch "$RECOVERY_FILE" "$RECOVERY_SHA256"
 
 	info "Бэкап разделов"
 	backup_parts
@@ -407,19 +384,20 @@ main() {
 	summary
 	confirm "Продолжить?"
 
-	info "Подготовка UBI-образа"
-	build_ubi_image
+	info "Запись загрузчика"
+	warn "не выключайте питание"
+	enable_mtd_write
+	[ "$NEED_BL2" = 1 ] && write_part bl2 "$WORKDIR/$BL2_FILE" "$BL2_SHA256"
+	[ "$NEED_FIP" = 1 ] && write_part fip "$WORKDIR/$FIP_FILE" "$FIP_SHA256"
 
-	if [ "$NEED_BL2" = 1 ] || [ "$NEED_FIP" = 1 ]; then
-		info "Запись загрузчика"
-		warn "не выключайте питание"
-		enable_mtd_write
-		[ "$NEED_BL2" = 1 ] && write_part bl2 "$WORKDIR/$BL2_FILE" "$BL2_SHA256"
-		[ "$NEED_FIP" = 1 ] && write_part fip "$WORKDIR/$FIP_FILE" "$FIP_SHA256"
-	fi
+	mtd erase u-boot-env > /dev/null 2>&1 || die "не удалось стереть u-boot-env"
+	ok "u-boot-env стёрт"
 
 	next_steps
-	sysupgrade -F -n "$UBI_IMAGE"
+	info "Стирание ubi и перезагрузка"
+	sync
+	mtd -r erase ubi
+	die "не удалось стереть ubi. Загрузчик уже записан: перезагрузитесь с зажатой кнопкой reset, чтобы попасть в U-Boot"
 }
 
 main "$@"

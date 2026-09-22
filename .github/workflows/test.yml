@@ -16,7 +16,7 @@ jobs:
           sudo apt-get install -y busybox mtd-utils
 
       - name: shellcheck
-        run: shellcheck flash.sh tests/run.sh
+        run: shellcheck flash.sh flash-512m.sh tests/run.sh
 
       - name: Scenarios (dash + coreutils)
         run: sh tests/run.sh

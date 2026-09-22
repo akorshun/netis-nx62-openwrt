@@ -1,13 +1,14 @@
 #!/bin/sh
 # shellcheck shell=dash disable=SC2015
 #
-# Прогоняет flash.sh на поддельном роутере: /proc/mtd, /sys/class/mtd и
-# /dev/mtdN — обычные файлы, mtd/wget/apk/insmod/sysupgrade — заглушки.
+# Прогоняет flash.sh и flash-512m.sh на поддельном роутере: /proc/mtd,
+# /sys/class/mtd и /dev/mtdN — обычные файлы, mtd/wget/apk/insmod/sysupgrade —
+# заглушки.
 #
 #   sh tests/run.sh
 #   UBINIZE=real sh tests/run.sh      # настоящий ubinize, образ → tests/out-recovery.ubi
 #   SH="busybox sh" BB_PATH=/tmp/bb sh tests/run.sh
-#                                     # flash.sh под busybox ash, утилиты из busybox
+#                                     # скрипты под busybox ash, утилиты из busybox
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d)
@@ -17,9 +18,10 @@ FAILED=0
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; FAILED=1; }
 
-# <каталог-корень> <размер ubi в hex> <bad_blocks в fip>
+# <каталог-корень> <размер ubi в hex> [bad_blocks в fip] [блок] [страница]
 make_router() {
-	local root="$1" ubi_size="$2" fip_bad="${3:-0}" idx name off size
+	local root="$1" ubi_size="$2" fip_bad="${3:-0}" erasesize="${4:-131072}" \
+		writesize="${5:-2048}" idx name off size
 
 	mkdir -p "$root/proc" "$root/dev" "$root/tmp/sysinfo" "$root/etc" \
 		"$root/lib/upgrade" "$root/lib/modules/6.12.94"
@@ -32,13 +34,13 @@ make_router() {
 		off=${entry#*:}
 		size=${off#*:}
 		off=${off%%:*}
-		printf 'mtd%d: %08x 00020000 "%s"\n' "$idx" "$size" "$name" >> "$root/proc/mtd"
+		printf 'mtd%d: %08x %08x "%s"\n' "$idx" "$size" "$erasesize" "$name" >> "$root/proc/mtd"
 		mkdir -p "$root/sys/class/mtd/mtd$idx"
 		echo $(( off )) > "$root/sys/class/mtd/mtd$idx/offset"
 		echo $(( size )) > "$root/sys/class/mtd/mtd$idx/size"
-		echo 131072 > "$root/sys/class/mtd/mtd$idx/erasesize"
-		echo 2048 > "$root/sys/class/mtd/mtd$idx/writesize"
-		echo 2048 > "$root/sys/class/mtd/mtd$idx/subpagesize"
+		echo "$erasesize" > "$root/sys/class/mtd/mtd$idx/erasesize"
+		echo "$writesize" > "$root/sys/class/mtd/mtd$idx/writesize"
+		echo "$writesize" > "$root/sys/class/mtd/mtd$idx/subpagesize"
 		echo 0 > "$root/sys/class/mtd/mtd$idx/bad_blocks"
 		# bl2, factory и fip в официальном DTS только для чтения
 		case "$name" in
@@ -97,16 +99,25 @@ make_stubs() {
 		case "\$url" in
 		https://raw.githubusercontent.com/*) [ "\$FAIL_REPO" = 1 ] && exit 8 ;;
 		esac
-		cp "$TOP/firmware/\${url##*/}" "\$out"
+		for f in "$TOP/firmware/\${url##*/}" "$TOP/firmware/512m/\${url##*/}"; do
+			[ -f "\$f" ] && exec cp "\$f" "\$out"
+		done
+		exit 8
 	EOF
 
-	# mtd: erase/write по поддельным /dev/mtdN, как настоящий — только в writable
+	# mtd: erase/write по поддельным /dev/mtdN, как настоящий — только в writable.
+	# -r «перезагружает»: убивает запустивший скрипт shell, как reboot.
 	cat > "$bin/mtd" <<-'EOF'
 		#!/bin/sh
 		idx_of() {
 			sed -n "s/^mtd\([0-9]*\): [0-9a-f]* [0-9a-f]* \"$1\"\$/\1/p" "$NX62_ROOT/proc/mtd"
 		}
 		echo "mtd $*" >> "$NX62_LOG/mtd.log"
+		reboot=0
+		while [ "${1#-}" != "$1" ]; do
+			[ "$1" = -r ] && reboot=1
+			shift
+		done
 		case "$1" in
 		erase) part="$2" ;;
 		write) file="$2"; part="$3" ;;
@@ -120,7 +131,12 @@ make_stubs() {
 		size=$(cat "$NX62_ROOT/sys/class/mtd/mtd$idx/size")
 		case "$1" in
 		erase)
-			head -c "$size" /dev/zero | tr '\000' '\377' > "$dev"
+			# содержимое огромного ubi тестам не нужно
+			if [ "$part" = ubi ]; then
+				: > "$dev.erased"
+			else
+				head -c "$size" /dev/zero | tr '\000' '\377' > "$dev"
+			fi
 			;;
 		write)
 			fsize=$(wc -c < "$file" | tr -d ' ')
@@ -128,6 +144,10 @@ make_stubs() {
 			mv "$dev.new" "$dev"
 			;;
 		esac
+		if [ "$reboot" = 1 ]; then
+			echo reboot >> "$NX62_LOG/mtd.log"
+			kill -9 "$PPID"
+		fi
 	EOF
 
 	cat > "$bin/apk" <<-'EOF'
@@ -171,7 +191,7 @@ make_stubs() {
 	chmod +x "$bin"/*
 }
 
-# <имя сценария> <корень> <аргументы flash.sh...>
+# <имя сценария> <корень> <аргументы скрипта...>; скрипт — $SCRIPT или flash.sh
 run_flash() {
 	local name="$1" root="$2"
 	shift 2
@@ -179,9 +199,13 @@ run_flash() {
 	export NX62_ROOT="$root" NX62_WORKDIR="$T/$name/work" NX62_LOG="$T/$name/log"
 	mkdir -p "$NX62_LOG"
 	# shellcheck disable=SC2086 # SH может быть «busybox sh»
-	PATH="$T/bin:${BB_PATH:+$BB_PATH:}$PATH" ${SH:-sh} "$TOP/flash.sh" "$@" \
+	PATH="$T/bin:${BB_PATH:+$BB_PATH:}$PATH" ${SH:-sh} "$TOP/${SCRIPT:-flash.sh}" "$@" \
 		> "$T/$name/out" 2>&1 < /dev/null
 	echo $? > "$T/$name/rc"
+}
+
+rc_of() {
+	cat "$T/$1/rc"
 }
 
 sha_of_head() { # <файл> <размер>
@@ -202,10 +226,12 @@ check_written() { # <сценарий> <корень>
 
 make_stubs "$T/bin"
 
+# --- flash.sh: стандартная версия, 128 МБ ---
+
 # 1. Штатный запуск с -y: всё скачивается, пишется, вызывается sysupgrade
 make_router "$T/r1" 0x7a80000
 run_flash ok "$T/r1" -y
-if [ "$(cat "$T/ok/rc")" = 0 ]; then pass "ok: код возврата 0"; else fail "ok: код возврата $(cat "$T/ok/rc")"; fi
+[ "$(rc_of ok)" = 0 ] && pass "ok: код возврата 0" || fail "ok: код возврата $(rc_of ok)"
 check_written ok "$T/r1"
 grep -q 'insmod mtd-rw i_want_a_brick=1' "$T/ok/log/insmod.log" 2>/dev/null &&
 	pass "ok: mtd-rw загружен" || fail "ok: mtd-rw не загружен"
@@ -230,7 +256,7 @@ fi
 
 # 2. Повторный запуск: загрузчик уже на месте, пишется только ubi
 run_flash again "$T/r1" -y
-[ "$(cat "$T/again/rc")" = 0 ] && ! grep -q '^mtd ' "$T/again/log/mtd.log" 2>/dev/null &&
+[ "$(rc_of again)" = 0 ] && ! grep -q '^mtd ' "$T/again/log/mtd.log" 2>/dev/null &&
 	grep -q 'уже записан, пропуск' "$T/again/out" && [ -s "$T/again/log/sysupgrade.log" ] &&
 	pass "again: bl2/fip не перезаписываются, sysupgrade вызывается" ||
 	fail "again: $(tail -n 5 "$T/again/out")"
@@ -238,39 +264,108 @@ run_flash again "$T/r1" -y
 # 3. Репозиторий недоступен — образы берутся с downloads.openwrt.org
 make_router "$T/r3" 0x7a80000
 FAIL_REPO=1 run_flash mirror "$T/r3" -y
-[ "$(cat "$T/mirror/rc")" = 0 ] && grep -q '^https://downloads.openwrt.org/' "$T/mirror/log/wget.log" &&
+[ "$(rc_of mirror)" = 0 ] && grep -q '^https://downloads.openwrt.org/' "$T/mirror/log/wget.log" &&
 	pass "mirror: запасной источник" || fail "mirror: $(tail -n 5 "$T/mirror/out")"
 
 # 4. Без -y и без терминала: вопрос задать нельзя, ничего не пишется
 make_router "$T/r4" 0x7a80000
 run_flash notty "$T/r4"
-[ "$(cat "$T/notty/rc")" = 1 ] && grep -q 'добавьте -y' "$T/notty/out" &&
+[ "$(rc_of notty)" = 1 ] && grep -q 'добавьте -y' "$T/notty/out" &&
 	[ ! -e "$T/notty/log/mtd.log" ] && [ ! -e "$T/notty/log/sysupgrade.log" ] &&
-	pass "notty: остановка до записи с подсказкой про -y" || fail "notty: rc=$(cat "$T/notty/rc"): $(tail -n 2 "$T/notty/out")"
+	pass "notty: остановка до записи с подсказкой про -y" || fail "notty: rc=$(rc_of notty): $(tail -n 2 "$T/notty/out")"
 
 # 5. Разметка стоковая / NMBM (ubi 0x7280000) — отказ
 make_router "$T/r5" 0x7280000
 run_flash nmbm "$T/r5" -y
-[ "$(cat "$T/nmbm/rc")" = 1 ] && [ ! -e "$T/nmbm/log/mtd.log" ] && grep -q 'раздел ubi' "$T/nmbm/out" &&
+[ "$(rc_of nmbm)" = 1 ] && [ ! -e "$T/nmbm/log/mtd.log" ] && grep -q 'раздел ubi' "$T/nmbm/out" &&
 	pass "nmbm: чужая разметка отклонена" || fail "nmbm: $(tail -n 3 "$T/nmbm/out")"
 
 # 6. Bad-блок в fip — отказ
 make_router "$T/r6" 0x7a80000 1
 run_flash badblock "$T/r6" -y
-[ "$(cat "$T/badblock/rc")" = 1 ] && [ ! -e "$T/badblock/log/mtd.log" ] &&
-	pass "badblock: отказ при bad-блоке в fip" || fail "badblock: rc=$(cat "$T/badblock/rc")"
+[ "$(rc_of badblock)" = 1 ] && [ ! -e "$T/badblock/log/mtd.log" ] &&
+	pass "badblock: отказ при bad-блоке в fip" || fail "badblock: rc=$(rc_of badblock)"
 
 # 7. Другая модель — отказ
 make_router "$T/r7" 0x7a80000
 echo "netcore,n60" > "$T/r7/tmp/sysinfo/board_name"
 run_flash board "$T/r7" -y
-[ "$(cat "$T/board/rc")" = 1 ] && grep -q "модель 'netcore,n60'" "$T/board/out" &&
+[ "$(rc_of board)" = 1 ] && grep -q "модель 'netcore,n60'" "$T/board/out" &&
 	pass "board: чужая модель отклонена" || fail "board: $(tail -n 3 "$T/board/out")"
+
+# 8. Версия 512 МБ (блок 256 КБ, страница 4 КБ) — отказ с подсказкой про flash-512m.sh
+make_router "$T/r8" 0x1f400000 0 262144 4096
+run_flash is512 "$T/r8" -y
+[ "$(rc_of is512)" = 1 ] && [ ! -e "$T/is512/log/mtd.log" ] && grep -q 'flash-512m.sh' "$T/is512/out" &&
+	pass "is512: flash.sh отправляет на flash-512m.sh" || fail "is512: $(tail -n 3 "$T/is512/out")"
+
+# --- flash-512m.sh: версия с 512 МБ ROM ---
+
+BL2_512=9b958b6ff922f55aa20dcf81afc5052152c020a5b0fc9ca50d7fd246cd560388
+FIP_512=e4d87f39ebc01f5b5cf8428adc000cb327424f7b223622782bb876d1ebf34aed
+
+# <сценарий> <корень>: загрузчик записан, env стёрт, последним шёл mtd -r erase ubi
+check_512() {
+	local name="$1" root="$2"
+
+	[ "$(rc_of "$name")" = 137 ] && [ "$(tail -n 1 "$T/$name/log/mtd.log")" = reboot ] &&
+		[ "$(tail -n 2 "$T/$name/log/mtd.log" | head -n 1)" = "mtd -r erase ubi" ] &&
+		pass "$name: последним mtd -r erase ubi и перезагрузка" ||
+		fail "$name: rc=$(rc_of "$name"), $(tail -n 3 "$T/$name/out")"
+	[ "$(sha256sum < "$root/dev/mtd0" | cut -d ' ' -f 1)" = "$BL2_512" ] &&
+		pass "$name: bl2 = WildEdition" || fail "$name: bl2 не записан"
+	[ "$(sha256sum < "$root/dev/mtd3" | cut -d ' ' -f 1)" = "$FIP_512" ] &&
+		pass "$name: fip = WildEdition" || fail "$name: fip не записан"
+	[ "$(tr -d '\377' < "$root/dev/mtd1" | wc -c | tr -d ' ')" = 0 ] &&
+		pass "$name: u-boot-env стёрт" || fail "$name: u-boot-env не стёрт"
+	[ "$(tr -d 'C' < "$root/dev/mtd2" | wc -c | tr -d ' ')" = 0 ] &&
+		pass "$name: factory не тронут" || fail "$name: factory изменён"
+}
+
+# 9. Штатный запуск на 512 МБ с официальным DTS (ubi 122,5 МБ)
+make_router "$T/s1" 0x7a80000 0 262144 4096
+SCRIPT=flash-512m.sh run_flash ok512 "$T/s1" -y
+check_512 ok512 "$T/s1"
+[ "$(tr -d 'A' < "$T/ok512/work/backup/bl2.bin" | wc -c | tr -d ' ')" = 0 ] &&
+	(cd "$T/ok512/work/backup" && sha256sum -c SHA256SUMS > /dev/null 2>&1) &&
+	pass "ok512: бэкап снят до записи" || fail "ok512: бэкап"
+
+# 10. Повторный запуск: загрузчик не перезаписывается, но env/ubi стираются
+SCRIPT=flash-512m.sh run_flash again512 "$T/s1" -y
+! grep -q '^mtd write' "$T/again512/log/mtd.log" && grep -q 'уже записан, пропуск' "$T/again512/out" &&
+	pass "again512: bl2/fip не перезаписываются" || fail "again512: $(tail -n 5 "$T/again512/out")"
+check_512 again512 "$T/s1"
+
+# 11. Прошивка с ubi на 500 МБ и именем платы от другой сборки, репозиторий недоступен
+make_router "$T/s3" 0x1f400000 0 262144 4096
+echo "netcore,n60-pro-512m" > "$T/s3/tmp/sysinfo/board_name"
+FAIL_REPO=1 SCRIPT=flash-512m.sh run_flash cdn512 "$T/s3" -y
+check_512 cdn512 "$T/s3"
+grep -q '^https://cdn.jsdelivr.net/' "$T/cdn512/log/wget.log" &&
+	pass "cdn512: запасной источник jsDelivr" || fail "cdn512: jsDelivr не использовался"
+
+# 12. Стандартная версия 128 МБ — отказ с подсказкой про flash.sh
+make_router "$T/s4" 0x7a80000
+SCRIPT=flash-512m.sh run_flash is128 "$T/s4" -y
+[ "$(rc_of is128)" = 1 ] && [ ! -e "$T/is128/log/mtd.log" ] && grep -q 'main/flash.sh' "$T/is128/out" &&
+	pass "is128: flash-512m.sh отправляет на flash.sh" || fail "is128: $(tail -n 3 "$T/is128/out")"
+
+# 13. Без -y и без терминала — остановка до записи
+make_router "$T/s5" 0x7a80000 0 262144 4096
+SCRIPT=flash-512m.sh run_flash notty512 "$T/s5"
+[ "$(rc_of notty512)" = 1 ] && [ ! -e "$T/notty512/log/mtd.log" ] && grep -q 'добавьте -y' "$T/notty512/out" &&
+	pass "notty512: остановка до записи" || fail "notty512: rc=$(rc_of notty512)"
+
+# 14. Bad-блок в fip — отказ
+make_router "$T/s6" 0x7a80000 1 262144 4096
+SCRIPT=flash-512m.sh run_flash badblock512 "$T/s6" -y
+[ "$(rc_of badblock512)" = 1 ] && [ ! -e "$T/badblock512/log/mtd.log" ] &&
+	pass "badblock512: отказ при bad-блоке в fip" || fail "badblock512: rc=$(rc_of badblock512)"
 
 if [ "$FAILED" = 0 ]; then
 	echo "Все сценарии прошли."
 else
-	echo "Есть ошибки. Вывод первого сценария:"
-	cat "$T/ok/out"
+	echo "Есть ошибки. Вывод первого сценария каждого скрипта:"
+	cat "$T/ok/out" "$T/ok512/out"
 fi
 exit "$FAILED"
