@@ -61,6 +61,33 @@ mtd_attr() { # <номер> <атрибут>
 	cat "$ROOT/sys/class/mtd/mtd$1/$2" 2>/dev/null
 }
 
+# Объём всей микросхемы NAND в МиБ. Разделы его не показывают, а блок 128 КБ и
+# страница 2 КБ бывают и у 128 МБ, и у 512 МБ (Winbond W25N04KV). Берём строку
+# драйвера «spi-nand spi0.0: 512 MiB, block size: …» из журнала ядра, а если
+# она вытеснена — резерв UBI под bad-блоки, который ядро считает по всему
+# чипу: 20 блоков на каждые 1024.
+flash_size_mib() {
+	local size ubi resv bad es
+
+	size=$({ dmesg; logread; } 2>/dev/null |
+		sed -n 's/.*spi-nand.*: \([0-9][0-9]*\) MiB, block size.*/\1/p' | tail -n 1)
+	if [ -n "$size" ]; then
+		echo "$size"
+		return 0
+	fi
+
+	for ubi in "$ROOT"/sys/class/ubi/ubi[0-9]*; do
+		[ "$(cat "$ubi/mtd_num" 2>/dev/null)" = "$(mtd_index ubi)" ] || continue
+		resv=$(cat "$ubi/reserved_for_bad" 2>/dev/null)
+		bad=$(cat "$ubi/bad_peb_count" 2>/dev/null)
+		es=$(mtd_attr "$(mtd_index ubi)" erasesize)
+		[ -n "$resv" ] && [ -n "$bad" ] && [ -n "$es" ] || continue
+		echo $(( (resv + bad) * es / 20480 ))
+		return 0
+	done
+	return 1
+}
+
 sha256_of() {
 	sha256sum "$1" | cut -d ' ' -f 1
 }
@@ -104,18 +131,25 @@ check_system() {
 }
 
 check_layout() {
-	local entry name off size idx real_off real_size
+	local entry name off size idx real_off real_size mib
 
 	idx=$(mtd_index fip)
 	[ -n "$idx" ] || die "в /proc/mtd нет раздела 'fip'"
-	case "$(mtd_attr "$idx" erasesize)/$(mtd_attr "$idx" writesize)" in
-	131072/2048)
+	mib=$(flash_size_mib)
+	case "$(mtd_attr "$idx" erasesize)/$(mtd_attr "$idx" writesize)/${mib:-?}" in
+	131072/2048/128)
 		;;
-	262144/4096)
+	131072/2048/\?)
+		warn "не удалось узнать объём NAND, считаю версию стандартной (128 МБ)"
+		;;
+	*/512)
+		die "это версия с 512 МБ ROM. Для неё: wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash-512m.sh | sh"
+		;;
+	262144/4096/*)
 		die "это версия с 512 МБ ROM (блок 256 КБ, страница 4 КБ). Для неё: wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash-512m.sh | sh"
 		;;
 	*)
-		die "NAND с блоком $(mtd_attr "$idx" erasesize) и страницей $(mtd_attr "$idx" writesize) байт: это не стандартная версия (128 КБ / 2 КБ)"
+		die "NAND: блок $(mtd_attr "$idx" erasesize), страница $(mtd_attr "$idx" writesize) байт, объём ${mib:-?} МиБ — это не стандартная версия (128 МБ)"
 		;;
 	esac
 

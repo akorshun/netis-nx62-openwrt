@@ -18,10 +18,12 @@ FAILED=0
 pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*"; FAILED=1; }
 
-# <каталог-корень> <размер ubi в hex> [bad_blocks в fip] [блок] [страница]
+# <каталог-корень> <размер ubi в hex> [bad_blocks в fip] [блок] [страница] [чип]
+# чип: «512» — строка spi-nand в журнале ядра и резерв UBI, «ubi:512» — только
+# резерв UBI, «none» — объём узнать неоткуда. По умолчанию 128 при блоке 128 КБ.
 make_router() {
 	local root="$1" ubi_size="$2" fip_bad="${3:-0}" erasesize="${4:-131072}" \
-		writesize="${5:-2048}" idx name off size
+		writesize="${5:-2048}" chip="${6:-}" idx name off size mib
 
 	mkdir -p "$root/proc" "$root/dev" "$root/tmp/sysinfo" "$root/etc" \
 		"$root/lib/upgrade" "$root/lib/modules/6.12.94"
@@ -55,6 +57,22 @@ make_router() {
 	done
 	echo "$fip_bad" > "$root/sys/class/mtd/mtd3/bad_blocks"
 
+	if [ -z "$chip" ]; then
+		chip=512
+		[ "$erasesize" = 131072 ] && chip=128
+	fi
+	mib=${chip#ubi:}
+	if [ "$chip" = "$mib" ] && [ "$chip" != none ]; then
+		printf '[    0.927302] spi-nand spi0.0: %s MiB, block size: %s KiB, page size: %s, OOB size: 128\n' \
+			"$mib" $(( erasesize / 1024 )) "$writesize" > "$root/dmesg.txt"
+	fi
+	if [ "$chip" != none ]; then
+		mkdir -p "$root/sys/class/ubi/ubi0"
+		echo 4 > "$root/sys/class/ubi/ubi0/mtd_num"
+		echo 0 > "$root/sys/class/ubi/ubi0/bad_peb_count"
+		echo $(( mib * 20480 / erasesize )) > "$root/sys/class/ubi/ubi0/reserved_for_bad"
+	fi
+
 	echo "netcore,n60-pro" > "$root/tmp/sysinfo/board_name"
 	cat > "$root/etc/openwrt_release" <<-'EOF'
 		DISTRIB_ID='OpenWrt'
@@ -80,6 +98,17 @@ make_stubs() {
 	cat > "$bin/uci" <<-'EOF'
 		#!/bin/sh
 		echo "192.168.0.1/24"
+	EOF
+
+	cat > "$bin/dmesg" <<-'EOF'
+		#!/bin/sh
+		cat "$NX62_ROOT/dmesg.txt" 2>/dev/null
+		exit 0
+	EOF
+
+	cat > "$bin/logread" <<-'EOF'
+		#!/bin/sh
+		exit 0
 	EOF
 
 	# wget: отдаёт файлы из firmware/, репозиторий можно «сломать» FAIL_REPO=1
@@ -299,21 +328,43 @@ run_flash is512 "$T/r8" -y
 [ "$(rc_of is512)" = 1 ] && [ ! -e "$T/is512/log/mtd.log" ] && grep -q 'flash-512m.sh' "$T/is512/out" &&
 	pass "is512: flash.sh отправляет на flash-512m.sh" || fail "is512: $(tail -n 3 "$T/is512/out")"
 
+# 8a. Winbond W25N04KV: 512 МБ при блоке 128 КБ и странице 2 КБ — тоже на flash-512m.sh
+make_router "$T/r8a" 0x7a80000 0 131072 2048 512
+run_flash winbond "$T/r8a" -y
+[ "$(rc_of winbond)" = 1 ] && [ ! -e "$T/winbond/log/mtd.log" ] && grep -q 'flash-512m.sh' "$T/winbond/out" &&
+	pass "winbond: flash.sh отправляет 512 МБ со страницей 2 КБ на flash-512m.sh" ||
+	fail "winbond: $(tail -n 3 "$T/winbond/out")"
+
+# 8b. Объём не узнать (журнал вытеснен, UBI нет) — считается стандартной версией
+make_router "$T/r8b" 0x7a80000 0 131072 2048 none
+run_flash nosize "$T/r8b" -y
+[ "$(rc_of nosize)" = 0 ] && grep -q 'не удалось узнать объём NAND' "$T/nosize/out" &&
+	pass "nosize: без объёма flash.sh идёт как для 128 МБ с предупреждением" ||
+	fail "nosize: rc=$(rc_of nosize) $(tail -n 3 "$T/nosize/out")"
+
 # --- flash-512m.sh: версия с 512 МБ ROM ---
 
 BL2_512=9b958b6ff922f55aa20dcf81afc5052152c020a5b0fc9ca50d7fd246cd560388
 FIP_512=e4d87f39ebc01f5b5cf8428adc000cb327424f7b223622782bb876d1ebf34aed
 
-# <сценарий> <корень>: загрузчик записан, env стёрт, последним шёл mtd -r erase ubi
+OWRT_BL2=4215ec48f52b26ce0d93c2f67d4e435d6372c2701b9574b59d2ed51aaef0acf2
+
+# <сценарий> <корень> [wild|owrt]: загрузчик записан, env стёрт, последним шёл
+# mtd -r erase ubi. BL2 — WildEdition (страница 4 КБ) или официальный (2 КБ).
 check_512() {
-	local name="$1" root="$2"
+	local name="$1" root="$2" bl2="${3:-wild}"
 
 	[ "$(rc_of "$name")" = 137 ] && [ "$(tail -n 1 "$T/$name/log/mtd.log")" = reboot ] &&
 		[ "$(tail -n 2 "$T/$name/log/mtd.log" | head -n 1)" = "mtd -r erase ubi" ] &&
 		pass "$name: последним mtd -r erase ubi и перезагрузка" ||
 		fail "$name: rc=$(rc_of "$name"), $(tail -n 3 "$T/$name/out")"
-	[ "$(sha256sum < "$root/dev/mtd0" | cut -d ' ' -f 1)" = "$BL2_512" ] &&
-		pass "$name: bl2 = WildEdition" || fail "$name: bl2 не записан"
+	if [ "$bl2" = wild ]; then
+		[ "$(sha256sum < "$root/dev/mtd0" | cut -d ' ' -f 1)" = "$BL2_512" ] &&
+			pass "$name: bl2 = WildEdition" || fail "$name: bl2 не WildEdition"
+	else
+		[ "$(sha_of_head "$root/dev/mtd0" 209931)" = "$OWRT_BL2" ] &&
+			pass "$name: bl2 = официальный OpenWrt" || fail "$name: bl2 не официальный"
+	fi
 	[ "$(sha256sum < "$root/dev/mtd3" | cut -d ' ' -f 1)" = "$FIP_512" ] &&
 		pass "$name: fip = WildEdition" || fail "$name: fip не записан"
 	[ "$(tr -d '\377' < "$root/dev/mtd1" | wc -c | tr -d ' ')" = 0 ] &&
@@ -337,7 +388,7 @@ SCRIPT=flash-512m.sh run_flash again512 "$T/s1" -y
 check_512 again512 "$T/s1"
 
 # 11. Прошивка с ubi на 500 МБ и именем платы от другой сборки, репозиторий недоступен
-make_router "$T/s3" 0x1f400000 0 262144 4096
+make_router "$T/s3" 0x1f400000 0 262144 4096 none
 echo "netcore,n60-pro-512m" > "$T/s3/tmp/sysinfo/board_name"
 FAIL_REPO=1 SCRIPT=flash-512m.sh run_flash cdn512 "$T/s3" -y
 check_512 cdn512 "$T/s3"
@@ -361,6 +412,37 @@ make_router "$T/s6" 0x7a80000 1 262144 4096
 SCRIPT=flash-512m.sh run_flash badblock512 "$T/s6" -y
 [ "$(rc_of badblock512)" = 1 ] && [ ! -e "$T/badblock512/log/mtd.log" ] &&
 	pass "badblock512: отказ при bad-блоке в fip" || fail "badblock512: rc=$(rc_of badblock512)"
+
+# 15. Winbond 512 МБ (страница 2 КБ), объём из журнала ядра: официальный BL2 + FIP WildEdition
+make_router "$T/w1" 0x7a80000 0 131072 2048 512
+SCRIPT=flash-512m.sh run_flash winbond512 "$T/w1" -y
+check_512 winbond512 "$T/w1" owrt
+grep -q 'Winbond W25N04KV' "$T/winbond512/out" && grep -q '^https://raw.githubusercontent.com/.*/firmware/openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-preloader.bin$' "$T/winbond512/log/wget.log" &&
+	pass "winbond512: определён Winbond, взят официальный BL2" || fail "winbond512: $(grep -E 'NAND|bl2' "$T/winbond512/out")"
+
+# 16. То же, но журнал вытеснен: объём по резерву UBI под bad-блоки
+make_router "$T/w2" 0x7a80000 0 131072 2048 ubi:512
+SCRIPT=flash-512m.sh run_flash winbondubi "$T/w2" -y
+check_512 winbondubi "$T/w2" owrt
+
+# 17. Как на реальном роутере: официальные BL2 и FIP уже стоят — пишется только FIP
+make_router "$T/w3" 0x7a80000 0 131072 2048 512
+for f in "0 openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-preloader.bin" 		"3 openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-bl31-uboot.fip"; do
+	idx=${f%% *}
+	{ cat "$TOP/firmware/${f#* }"; head -c 2097152 /dev/zero | tr ' ' 'ÿ'; } |
+		head -c "$(cat "$T/w3/sys/class/mtd/mtd$idx/size")" > "$T/w3/dev/mtd$idx"
+done
+SCRIPT=flash-512m.sh run_flash winbondfip "$T/w3" -y
+! grep -q 'bl2$' "$T/winbondfip/log/mtd.log" && grep -q '^mtd write .* fip$' "$T/winbondfip/log/mtd.log" &&
+	pass "winbondfip: официальный BL2 не перезаписан, записан только FIP" ||
+	fail "winbondfip: $(cat "$T/winbondfip/log/mtd.log")"
+check_512 winbondfip "$T/w3" owrt
+
+# 18. Страница 2 КБ и объём не узнать — отказ до записи
+make_router "$T/w4" 0x7a80000 0 131072 2048 none
+SCRIPT=flash-512m.sh run_flash nosize512 "$T/w4" -y
+[ "$(rc_of nosize512)" = 1 ] && [ ! -e "$T/nosize512/log/mtd.log" ] && grep -q 'не удалось узнать объём NAND' "$T/nosize512/out" &&
+	pass "nosize512: без объёма отказ" || fail "nosize512: rc=$(rc_of nosize512) $(tail -n 2 "$T/nosize512/out")"
 
 if [ "$FAILED" = 0 ]; then
 	echo "Все сценарии прошли."

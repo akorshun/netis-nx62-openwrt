@@ -1,12 +1,16 @@
 #!/bin/sh
 # shellcheck shell=dash
 #
-# Netis NX62 / Netcore N60 Pro, версия с 512 МБ ROM (MT7986A, SPI-NAND
-# со страницей 4 КБ и блоком 256 КБ).
+# Netis NX62 / Netcore N60 Pro, версия с 512 МБ ROM (MT7986A).
 #
-# Записывает кастомный загрузчик U-Boot 2025.07-WildEdition (BL2 в bl2,
-# BL31 + U-Boot в fip), стирает u-boot-env и ubi и перезагружает роутер:
+# Записывает кастомный U-Boot 2025.07-WildEdition (BL31 + U-Boot в fip) и BL2
+# под свою микросхему NAND, стирает u-boot-env и ubi и перезагружает роутер:
 # U-Boot не находит прошивку и сам открывает веб-интерфейс с DHCP.
+#
+# BL2 зависит от NAND:
+#   Toshiba TC58CVG2S0HRAIG (страница 4 КБ, блок 256 КБ) — BL2 WildEdition;
+#   Winbond W25N04KV и др. (страница 2 КБ, блок 128 КБ) — официальный BL2
+#   OpenWrt 25.12.5: BL2 WildEdition собран только под страницу 4 КБ.
 #
 #   wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash-512m.sh | sh
 #   wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash-512m.sh | sh -s -- -y
@@ -14,11 +18,14 @@
 # https://github.com/akorshun/netis-nx62-openwrt
 
 REPO_URL="https://github.com/akorshun/netis-nx62-openwrt"
-REPO_RAW="https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/firmware/512m"
-REPO_CDN="https://cdn.jsdelivr.net/gh/akorshun/netis-nx62-openwrt@main/firmware/512m"
+REPO_RAW="https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/firmware"
+REPO_CDN="https://cdn.jsdelivr.net/gh/akorshun/netis-nx62-openwrt@main/firmware"
+OWRT_URL="https://downloads.openwrt.org/releases/25.12.5/targets/mediatek/filogic"
 
-BL2_FILE="netcore_n60-pro-512m-wildedition-bl2.bin"
-BL2_SHA256="9b958b6ff922f55aa20dcf81afc5052152c020a5b0fc9ca50d7fd246cd560388"
+WILD_BL2_FILE="netcore_n60-pro-512m-wildedition-bl2.bin"
+WILD_BL2_SHA256="9b958b6ff922f55aa20dcf81afc5052152c020a5b0fc9ca50d7fd246cd560388"
+OWRT_BL2_FILE="openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-preloader.bin"
+OWRT_BL2_SHA256="4215ec48f52b26ce0d93c2f67d4e435d6372c2701b9574b59d2ed51aaef0acf2"
 FIP_FILE="netcore_n60-pro-512m-wildedition-fip.bin"
 FIP_SHA256="e4d87f39ebc01f5b5cf8428adc000cb327424f7b223622782bb876d1ebf34aed"
 
@@ -39,6 +46,8 @@ WORKDIR="${NX62_WORKDIR:-/tmp/nx62-flash-512m}"
 AUTO_YES=0
 NEED_BL2=1
 NEED_FIP=1
+# Выбираются в check_layout по странице NAND
+BL2_FILE="" BL2_SHA256="" BL2_URLS="" BL2_DESC="" NAND_DESC=""
 
 C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_OFF=""
 if [ -t 1 ]; then
@@ -60,6 +69,32 @@ mtd_index() {
 
 mtd_attr() { # <номер> <атрибут>
 	cat "$ROOT/sys/class/mtd/mtd$1/$2" 2>/dev/null
+}
+
+# Объём всей микросхемы NAND в МиБ. Разделы его не показывают: берём строку
+# драйвера «spi-nand spi0.0: 512 MiB, block size: …» из журнала ядра, а если
+# она вытеснена — резерв UBI под bad-блоки, который ядро считает по всему
+# чипу: 20 блоков на каждые 1024.
+flash_size_mib() {
+	local size ubi resv bad es
+
+	size=$({ dmesg; logread; } 2>/dev/null |
+		sed -n 's/.*spi-nand.*: \([0-9][0-9]*\) MiB, block size.*/\1/p' | tail -n 1)
+	if [ -n "$size" ]; then
+		echo "$size"
+		return 0
+	fi
+
+	for ubi in "$ROOT"/sys/class/ubi/ubi[0-9]*; do
+		[ "$(cat "$ubi/mtd_num" 2>/dev/null)" = "$(mtd_index ubi)" ] || continue
+		resv=$(cat "$ubi/reserved_for_bad" 2>/dev/null)
+		bad=$(cat "$ubi/bad_peb_count" 2>/dev/null)
+		es=$(mtd_attr "$(mtd_index ubi)" erasesize)
+		[ -n "$resv" ] && [ -n "$bad" ] && [ -n "$es" ] || continue
+		echo $(( (resv + bad) * es / 20480 ))
+		return 0
+	done
+	return 1
 }
 
 sha256_of() {
@@ -110,18 +145,32 @@ check_system() {
 }
 
 check_layout() {
-	local entry name off size idx real_off real_size
+	local entry name off size idx real_off real_size mib
 
 	idx=$(mtd_index fip)
 	[ -n "$idx" ] || die "в /proc/mtd нет раздела 'fip'"
-	case "$(mtd_attr "$idx" erasesize)/$(mtd_attr "$idx" writesize)" in
-	262144/4096)
+	mib=$(flash_size_mib)
+	case "$(mtd_attr "$idx" erasesize)/$(mtd_attr "$idx" writesize)/${mib:-?}" in
+	262144/4096/512|262144/4096/\?)
+		NAND_DESC="NAND 512 МБ, страница 4 КБ (Toshiba)"
+		BL2_FILE="$WILD_BL2_FILE" BL2_SHA256="$WILD_BL2_SHA256"
+		BL2_URLS="$REPO_RAW/512m $REPO_CDN/512m"
+		BL2_DESC="BL2 WildEdition для страницы 4 КБ"
 		;;
-	131072/2048)
-		die "это стандартная версия на 128 МБ (блок 128 КБ, страница 2 КБ). Для неё: wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash.sh | sh"
+	131072/2048/512)
+		NAND_DESC="NAND 512 МБ, страница 2 КБ (Winbond W25N04KV или аналог)"
+		BL2_FILE="$OWRT_BL2_FILE" BL2_SHA256="$OWRT_BL2_SHA256"
+		BL2_URLS="$REPO_RAW $OWRT_URL"
+		BL2_DESC="официальный BL2 OpenWrt 25.12.5 (у WildEdition BL2 только под страницу 4 КБ)"
+		;;
+	131072/2048/128)
+		die "это стандартная версия на 128 МБ. Для неё: wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash.sh | sh"
+		;;
+	131072/2048/\?)
+		die "не удалось узнать объём NAND: страница 2 КБ бывает и у 128 МБ, и у 512 МБ. Перезагрузите роутер и сразу запустите скрипт снова"
 		;;
 	*)
-		die "NAND с блоком $(mtd_attr "$idx" erasesize) и страницей $(mtd_attr "$idx" writesize) байт: это не версия на 512 МБ (256 КБ / 4 КБ)"
+		die "NAND: блок $(mtd_attr "$idx" erasesize), страница $(mtd_attr "$idx" writesize) байт, объём ${mib:-?} МиБ — не похоже на версию с 512 МБ"
 		;;
 	esac
 
@@ -153,7 +202,7 @@ check_layout() {
 		[ "$(mtd_attr "$(mtd_index "$name")" bad_blocks)" = 0 ] ||
 			die "в разделе $name есть bad-блоки или ядро не сообщает их число — прошивать загрузчик так нельзя"
 	done
-	ok "NAND 512 МБ (блок 256 КБ, страница 4 КБ), bl2/fip без bad-блоков"
+	ok "$NAND_DESC, bl2/fip без bad-блоков"
 }
 
 check_tools() {
@@ -173,22 +222,22 @@ prepare_workdir() {
 		die "в $WORKDIR свободно $(( ${free_kb:-0} / 1024 )) МБ, нужно 16 МБ"
 }
 
-fetch() { # <файл> <sha256>
-	local file="$1" sum="$2" dst="$WORKDIR/$1" url
+fetch() { # <файл> <sha256> <базовые URL через пробел>
+	local file="$1" sum="$2" dst="$WORKDIR/$1" base
 
 	if [ -f "$dst" ] && [ "$(sha256_of "$dst")" = "$sum" ]; then
 		ok "$file (уже скачан)"
 		return 0
 	fi
 
-	for url in "$REPO_RAW/$file" "$REPO_CDN/$file"; do
+	for base in $3; do
 		rm -f "$dst"
-		if wget -q -T 30 --no-check-certificate -O "$dst" "$url" 2>/dev/null &&
+		if wget -q -T 30 --no-check-certificate -O "$dst" "$base/$file" 2>/dev/null &&
 		   [ -f "$dst" ] && [ "$(sha256_of "$dst")" = "$sum" ]; then
 			ok "$file"
 			return 0
 		fi
-		warn "не скачался или не совпала SHA-256: $url"
+		warn "не скачался или не совпала SHA-256: $base/$file"
 	done
 
 	rm -f "$dst"
@@ -223,9 +272,9 @@ summary() {
 	echo
 	info "Что будет сделано"
 	if [ "$NEED_BL2" = 1 ]; then
-		echo "  • bl2 ← BL2 WildEdition для NAND 512 МБ"
+		echo "  • bl2 ← $BL2_DESC"
 	else
-		echo "  • bl2: BL2 WildEdition уже записан, пропуск"
+		echo "  • bl2: $BL2_DESC уже записан, пропуск"
 	fi
 	if [ "$NEED_FIP" = 1 ]; then
 		echo "  • fip ← BL31 + U-Boot 2025.07-WildEdition"
@@ -373,8 +422,8 @@ main() {
 	prepare_workdir
 
 	info "Загрузка BL2 и U-Boot"
-	fetch "$BL2_FILE" "$BL2_SHA256"
-	fetch "$FIP_FILE" "$FIP_SHA256"
+	fetch "$BL2_FILE" "$BL2_SHA256" "$BL2_URLS"
+	fetch "$FIP_FILE" "$FIP_SHA256" "$REPO_RAW/512m $REPO_CDN/512m"
 
 	info "Бэкап разделов"
 	backup_parts
