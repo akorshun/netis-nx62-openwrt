@@ -39,10 +39,10 @@ jobs:
           grep -q 'LEB Size: 126976' info.txt
           grep -q 'Min I/O: 2048' info.txt
           grep -q 'Vol ID: 2' info.txt
-          grep -q 'vol_type: dynamic' info.txt
+          grep -q "vol_type: 'dynamic'" info.txt
           grep -q 'reserved_pebs: 74' info.txt
-          grep -q 'name: recovery' info.txt
-          ! grep -E 'errors: \[.+\]' info.txt
+          grep -q "name: 'recovery'" info.txt
+          ! grep -E "errors: '[^']+'" info.txt
           ubireader_extract_images -o ubi-out tests/out-recovery.ubi
           vol=$(find ubi-out -type f -name '*recovery*')
           head -c 9306112 "$vol" | sha256sum | tee sum.txt
