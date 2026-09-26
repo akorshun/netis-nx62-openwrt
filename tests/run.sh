@@ -249,7 +249,7 @@ check_written() { # <сценарий> <корень>
 	[ "$(sha_of_head "$root/dev/mtd3" 1095212)" = 1d5c3cbac086bf69598a374f8098776a1843384b014dda79f4673d8e4d7d645a ] &&
 		pass "$name: fip содержит BL31 + U-Boot" || fail "$name: fip не записан"
 	[ "$(head -c 4 "$T/$name/log/sysupgrade-image" 2>/dev/null)" = "UBI#" ] &&
-		grep -q -- '^sysupgrade -F -n .*/recovery.ubi$' "$T/$name/log/sysupgrade.log" &&
+		grep -q -- '^sysupgrade -F -n .*/initramfs.ubi$' "$T/$name/log/sysupgrade.log" &&
 		pass "$name: sysupgrade -F -n с UBI-образом" || fail "$name: sysupgrade не вызван как нужно"
 }
 
@@ -274,13 +274,23 @@ done
 [ "$(tr -d 'A' < "$T/ok/work/backup/bl2.bin" | wc -c | tr -d ' ')" = 0 ] &&
 	pass "ok: в бэкапе старый bl2, а не новый" || fail "ok: бэкап bl2 снят после записи"
 if [ "$UBINIZE" = real ]; then
-	cp "$T/ok/log/sysupgrade-image" "$TOP/tests/out-recovery.ubi" 2>/dev/null
+	cp "$T/ok/log/sysupgrade-image" "$TOP/tests/out-initramfs.ubi" 2>/dev/null
 else
-	grep -q '^ubinize -o .*/recovery.ubi -p 131072 -m 2048 -s 2048 ' "$T/ok/log/ubinize.log" &&
+	grep -q '^ubinize -o .*/initramfs.ubi -p 131072 -m 2048 -s 2048 ' "$T/ok/log/ubinize.log" &&
 		pass "ok: параметры ubinize" || fail "ok: параметры ubinize: $(cat "$T/ok/log/ubinize.log")"
-	grep -q '^vol_id=2$' "$T/ok/log/ubinize.cfg" && grep -q '^vol_name=recovery$' "$T/ok/log/ubinize.cfg" &&
+	grep -q '^vol_id=2$' "$T/ok/log/ubinize.cfg" && grep -q '^vol_name=fit$' "$T/ok/log/ubinize.cfg" &&
 		grep -q '^vol_type=dynamic$' "$T/ok/log/ubinize.cfg" &&
-		pass "ok: конфиг ubinize (recovery, id 2, dynamic)" || fail "ok: конфиг ubinize"
+		pass "ok: конфиг ubinize (fit, id 2, dynamic)" || fail "ok: конфиг ubinize: $(cat "$T/ok/log/ubinize.cfg")"
+fi
+
+# 1a. С -r initramfs кладётся в отдельный том recovery
+make_router "$T/r1r" 0x7a80000
+run_flash keeprec "$T/r1r" -y -r
+[ "$(rc_of keeprec)" = 0 ] && grep -q 'в томе recovery' "$T/keeprec/out" &&
+	pass "keeprec: -r кладёт initramfs в recovery" || fail "keeprec: $(tail -n 5 "$T/keeprec/out")"
+if [ "$UBINIZE" != real ]; then
+	grep -q '^vol_name=recovery$' "$T/keeprec/log/ubinize.cfg" &&
+		pass "keeprec: конфиг ubinize с томом recovery" || fail "keeprec: конфиг ubinize"
 fi
 
 # 2. Повторный запуск: загрузчик уже на месте, пишется только ubi

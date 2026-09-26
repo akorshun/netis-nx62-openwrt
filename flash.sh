@@ -4,11 +4,15 @@
 # Netis NX62 / Netcore N60 Pro (MT7986A, 128 МБ SPI-NAND).
 #
 # Записывает официальный загрузчик OpenWrt 25.12.5 (preloader в bl2, BL31 +
-# U-Boot в fip), форматирует раздел ubi целиком с initramfs 25.12.5 в томе
-# recovery и перезагружает роутер: U-Boot сам запускает initramfs из NAND.
+# U-Boot в fip), форматирует раздел ubi целиком с initramfs 25.12.5 в томе fit
+# и перезагружает роутер: U-Boot сам запускает initramfs из NAND. Прошивка,
+# которую вы зальёте из initramfs, заместит initramfs в томе fit.
+#
+# С -r initramfs кладётся в отдельный том recovery и остаётся в NAND: U-Boot
+# запустит его, если прошивки нет или ядро упало. Это стоит около 9 МБ.
 #
 #   wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash.sh | sh
-#   wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash.sh | sh -s -- -y
+#   wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash.sh | sh -s -- -y -r
 #
 # https://github.com/akorshun/netis-nx62-openwrt
 
@@ -32,12 +36,14 @@ fip:3670016:2097152 ubi:5767168:128450560"
 # Только для тестов: корень с подменёнными /proc, /sys, /dev и т. п.
 ROOT="${NX62_ROOT:-}"
 WORKDIR="${NX62_WORKDIR:-/tmp/nx62-flash}"
-UBI_IMAGE="$WORKDIR/recovery.ubi"
+UBI_IMAGE="$WORKDIR/initramfs.ubi"
 
 AUTO_YES=0
+KEEP_RECOVERY=0
 NEED_UBI_UTILS=0
 NEED_BL2=1
 NEED_FIP=1
+BOOT_VOL=fit
 
 C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_OFF=""
 if [ -t 1 ]; then
@@ -260,7 +266,13 @@ summary() {
 	else
 		echo "  • fip: BL31 + U-Boot 25.12.5 уже записан, пропуск"
 	fi
-	echo "  • ubi ← форматирование целиком, initramfs 25.12.5 в томе recovery"
+	if [ "$KEEP_RECOVERY" = 1 ]; then
+		echo "  • ubi ← форматирование целиком, initramfs 25.12.5 в томе recovery:"
+		echo "    он останется в NAND как аварийный (около 9 МБ)"
+	else
+		echo "  • ubi ← форматирование целиком, initramfs 25.12.5 в томе fit:"
+		echo "    прошивка заместит его, лишнего в NAND не останется"
+	fi
 	echo "  • перезагрузка в initramfs (192.168.1.1)"
 	echo
 	warn "текущая прошивка и все её настройки будут удалены"
@@ -321,11 +333,11 @@ build_ubi_image() {
 	# vol_id 2: тома ubootenv и ubootenv2 U-Boot при первом запуске создаст
 	# сам под номерами 0 и 1, как при штатной установке через TFTP.
 	cat > "$WORKDIR/ubinize.cfg" <<-EOF
-		[recovery]
+		[$BOOT_VOL]
 		mode=ubi
 		vol_id=2
 		vol_type=dynamic
-		vol_name=recovery
+		vol_name=$BOOT_VOL
 		image=$WORKDIR/$RECOVERY_FILE
 	EOF
 
@@ -336,7 +348,7 @@ build_ubi_image() {
 		die "ubinize завершился с ошибкой"
 	fi
 	[ "$(head -c 4 "$UBI_IMAGE")" = "UBI#" ] || die "ubinize собрал некорректный образ"
-	ok "UBI-образ с томом recovery: $(( $(file_size "$UBI_IMAGE") / 1024 )) КБ"
+	ok "UBI-образ: initramfs в томе $BOOT_VOL, $(( $(file_size "$UBI_IMAGE") / 1024 )) КБ"
 }
 
 enable_mtd_write() {
@@ -391,6 +403,9 @@ next_steps() {
 	echo "      LuCI: System → Backup / Flash Firmware → Flash image…"
 	echo "      терминал: sysupgrade -n /tmp/<файл>-sysupgrade.itb"
 	echo "   mtd erase ubi делать не нужно."
+	if [ "$KEEP_RECOVERY" = 1 ]; then
+		echo "   initramfs останется в NAND в томе recovery (около 9 МБ)."
+	fi
 	echo
 	echo "  Инструкция: $REPO_URL"
 	echo "=================================================================="
@@ -399,8 +414,10 @@ next_steps() {
 
 usage() {
 	cat <<-EOF
-		Использование: flash.sh [-y]
-		  -y, --yes   не задавать вопросов
+		Использование: flash.sh [-y] [-r]
+		  -y, --yes        не задавать вопросов
+		  -r, --recovery   оставить initramfs в NAND отдельным томом recovery
+		                   как аварийный (около 9 МБ)
 		Подробно: $REPO_URL
 	EOF
 }
@@ -410,6 +427,10 @@ main() {
 		case "$1" in
 		-y|--yes)
 			AUTO_YES=1
+			;;
+		-r|--recovery)
+			KEEP_RECOVERY=1
+			BOOT_VOL=recovery
 			;;
 		-h|--help)
 			usage
