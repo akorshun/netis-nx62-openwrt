@@ -251,10 +251,13 @@ check_tools() {
 	done
 	command -v ubinize >/dev/null 2>&1 || NEED_UBI_UTILS=1
 
+	# UBI-образ уезжает в nand_do_upgrade → nand_upgrade_ubinized. Имя платы в
+	# platform.sh искать бесполезно: в китайских сборках этой модели там нет,
+	# и её обрабатывает общая ветка.
 	grep -q '^nand_upgrade_ubinized()' "$ROOT/lib/upgrade/nand.sh" 2>/dev/null ||
 		die "sysupgrade этой прошивки не умеет записывать UBI-образы"
-	grep -q "$BOARD" "$ROOT/lib/upgrade/platform.sh" 2>/dev/null ||
-		die "sysupgrade этой прошивки не знает $BOARD"
+	grep -q 'nand_do_upgrade' "$ROOT/lib/upgrade/platform.sh" 2>/dev/null ||
+		die "sysupgrade этой прошивки не прошивает NAND"
 	ok "sysupgrade поддерживает UBI-образы"
 }
 
