@@ -28,10 +28,14 @@ FIP_SHA256="1d5c3cbac086bf69598a374f8098776a1843384b014dda79f4673d8e4d7d645a"
 RECOVERY_FILE="openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-initramfs-recovery.itb"
 RECOVERY_SHA256="8ceee0b72589da501ee7e9e34628491a385a6b2f2cf87fec005b1af29cd843b3"
 
-# Разметка официального DTS 25.12.5: смещение и размер в байтах.
-# ubi занимает всё до конца 128 МБ флешки, без NMBM.
+# Начало NAND одинаково у официальной и стоковой разметки: смещение и размер
+# в байтах. Раздел ubi проверяется отдельно: у официальной разметки он идёт до
+# конца 128 МБ флешки, у стоковой (в том числе китайских сборок) — до начала
+# служебной области NMBM. После прошивки разметка в любом случае официальная.
 LAYOUT="bl2:0:1048576 u-boot-env:1048576:524288 factory:1572864:2097152
-fip:3670016:2097152 ubi:5767168:128450560"
+fip:3670016:2097152"
+UBI_OFFSET=5767168
+FLASH_SIZE=134217728
 
 # Только для тестов: корень с подменёнными /proc, /sys, /dev и т. п.
 ROOT="${NX62_ROOT:-}"
@@ -44,6 +48,7 @@ NEED_UBI_UTILS=0
 NEED_BL2=1
 NEED_FIP=1
 BOOT_VOL=fit
+LAYOUT_DESC=""
 
 C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_OFF=""
 if [ -t 1 ]; then
@@ -172,15 +177,70 @@ check_layout() {
 		real_off=$(mtd_attr "$idx" offset)
 		real_size=$(mtd_attr "$idx" size)
 		if [ "$real_off" != "$off" ] || [ "$real_size" != "$size" ]; then
-			die "раздел $name: смещение $real_off, размер $real_size, ожидалось $off и $size. Скрипт только для стандартной версии на 128 МБ с разметкой официальной OpenWrt"
+			die "раздел $name: смещение $real_off, размер $real_size, ожидалось $off и $size — это не разметка Netcore N60 Pro"
 		fi
 	done
+
+	idx=$(mtd_index ubi)
+	[ -n "$idx" ] || die "в /proc/mtd нет раздела 'ubi'"
+	real_off=$(mtd_attr "$idx" offset)
+	real_size=$(mtd_attr "$idx" size)
+	[ "$real_off" = "$UBI_OFFSET" ] ||
+		die "раздел ubi начинается со смещения $real_off, ожидалось $UBI_OFFSET"
+	[ $(( real_off + real_size )) -le "$FLASH_SIZE" ] ||
+		die "раздел ubi выходит за пределы 128 МБ: смещение $real_off, размер $real_size"
+
+	if [ $(( real_off + real_size )) = "$FLASH_SIZE" ]; then
+		LAYOUT_DESC="разметка официальной OpenWrt, ubi до конца флешки"
+	else
+		LAYOUT_DESC="разметка стоковая, ubi $(( real_size / 1024 )) КБ (после прошивки станет официальной)"
+		check_nmbm "$(( real_off + real_size ))"
+	fi
 
 	for name in bl2 fip; do
 		[ "$(mtd_attr "$(mtd_index "$name")" bad_blocks)" = 0 ] ||
 			die "в разделе $name есть bad-блоки или ядро не сообщает их число — прошивать загрузчик так нельзя"
 	done
-	ok "разметка NAND: 128 МБ, bl2/fip без bad-блоков"
+	ok "NAND 128 МБ, $LAYOUT_DESC, bl2/fip без bad-блоков"
+}
+
+# Ячейка дерева устройств (4 байта, старший байт первым)
+dt_cell() { # <файл> <значение по умолчанию>
+	local hex
+	hex=$(hexdump -v -e '4/1 "%02x"' "$1" 2>/dev/null)
+	case "$hex" in
+	????????) echo $(( 0x$hex )) ;;
+	*) echo "$2" ;;
+	esac
+}
+
+# Прошивка со стоковой разметкой обычно работает через NMBM: ядро видит только
+# исправные блоки, а bl2/fip и factory пишутся по переназначенным адресам.
+# Официальные загрузчик и ядро читают те же разделы напрямую, поэтому переезд
+# безопасен, только если ни один блок не переназначен. Это видно по размеру:
+# разделы должны занимать всю область данных NMBM, до её служебной области.
+check_nmbm() { # <конец раздела ubi>
+	local dt dir mgmt ratio reserved blocks es
+
+	dt=$(find "$ROOT/sys/firmware/devicetree/base" -name 'mediatek,nmbm' 2>/dev/null | head -n 1)
+	[ -n "$dt" ] || return 0
+	dir=${dt%/*}
+	es=$(mtd_attr "$(mtd_index ubi)" erasesize)
+
+	mgmt=$({ dmesg; logread; } 2>/dev/null |
+		sed -n 's/.*NMBM management region starts at block \([0-9][0-9]*\).*/\1/p' | tail -n 1)
+	if [ -z "$mgmt" ]; then
+		ratio=$(dt_cell "$dir/mediatek,bmt-max-ratio" 1)
+		reserved=$(dt_cell "$dir/mediatek,bmt-max-reserved-blocks" 256)
+		blocks=$(( FLASH_SIZE / es ))
+		mgmt=$(( blocks * (16 - ratio) / 16 ))
+		[ $(( blocks - mgmt )) -gt "$reserved" ] && mgmt=$(( blocks - reserved ))
+	fi
+
+	if [ "$1" != $(( mgmt * es )) ]; then
+		die "прошивка использует NMBM, и часть блоков переназначена: разделы заканчиваются на $1, а область данных NMBM — на $(( mgmt * es )). Официальные загрузчик и ядро читают флешку напрямую, поэтому fip и factory оказались бы не на своих местах. Прошивать так нельзя"
+	fi
+	ok "NMBM: блоки не переназначены, адреса совпадут с прямыми"
 }
 
 check_tools() {
