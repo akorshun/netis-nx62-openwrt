@@ -188,6 +188,51 @@ wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/fla
 
 ⚠️ 125540 КБ не кратно блоку 256 КБ. U-Boot делает такой раздел только для чтения, и прошить его из веб-интерфейса не выйдет. К тому же в официальном OpenWrt для N60 Pro `ubi` — 125440 КБ.
 
+### Раскладка U-Boot и DTS прошивки: откуда берётся свободное место
+
+Сколько будет свободно в overlay, решает не раскладка U-Boot, а **раздел `ubi` в
+DTS прошивки**: ядро видит флеш только так, как его описывает DTB, и всё, что вне
+этого раздела (включая `data`), для системы не существует. У официального образа
+N60 Pro `ubi` — 125440 КБ, поэтому на чипе 512 МБ с любой раскладкой overlay
+получается около 77 МБ, а `data` не появляется в `/proc/mtd`.
+
+Точные границы раскладок этой сборки U-Boot (первые 5632 КБ одинаковы:
+`1024k(bl2),512k(u-boot-env),2048k(factory),2048k(fip)`):
+
+| Раскладка | `ubi` | `data` | Размер `ubi` для DTS |
+| --- | --- | --- | --- |
+| `default-spi-nand-512MB-ubi-500MB-data-1m` | `500m` | `1m` | 512000 КБ |
+| `spi-nand-512MB-MAX-506.5MB` | `518656k` | — | 518656 КБ |
+| `spi-nand-512MB-ubi-490MB` | `490m` | — | 501760 КБ |
+| `spi-nand-512MB-ubi-460MB` | `460m` | — | 471040 КБ |
+| `spi-nand-512MB-ubi-400MB-data-100m` | `400m` | `100m` | 409600 КБ |
+| `spi-nand-512MB-ubi-300MB-data-200m` | `300m` | `200m` | 307200 КБ |
+| `spi-nand-512MB-ubi-114.5MB-data-385m` | `117248k` | `385m` | 117248 КБ |
+| `spi-nand-512MB-ubi-122.5MB-data-377m` | `125540k` ⚠️ | `377m` | 125540 КБ |
+| `spi-nand-128MB-ubi-114.5MB` | `117248k` | — | 117248 КБ |
+| `spi-nand-128MB-ubi-MAX-122.5MB` | `125540k` ⚠️ | — | 125540 КБ |
+
+Пересобирать прошивку ради этого не нужно: `tools/retarget-ubi.py` меняет размер
+`ubi` прямо в готовом `*-sysupgrade.itb`. Правятся четыре байта в DTB, после чего
+пересчитываются контрольные суммы его узла в FIT — файл остаётся того же размера
+и той же структуры (в нашем образе отличий получается 26 байт).
+
+```sh
+python3 tools/retarget-ubi.py \
+  firmware/openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-argon-ru-squashfs-sysupgrade.itb \
+  openwrt-25.12.5-n60-pro-512m-ubi500-argon-ru-squashfs-sysupgrade.itb 512000
+```
+
+Полученный образ заливается через веб-интерфейс U-Boot с раскладкой, которой
+соответствует новый размер (для 512000 КБ — `default-spi-nand-512MB-ubi-500MB-data-1m`).
+Интерфейс пересоздаёт UBI по этой раскладке, поэтому ядро и загрузчик начинают
+видеть флеш одинаково, а `rootfs_data` занимает всё свободное место: на 500 МБ
+overlay выходит около 400 МБ вместо 77 МБ.
+
+Прошивать такой образ через `sysupgrade` из системы не стоит: UBI при этом
+остаётся отформатированным по прежней раскладке, и загрузчик со своей, меньшей
+границей может не собрать тома заново.
+
 ### Если роутер загрузил прежнюю систему вместо интерфейса
 
 Скрипт стирает `ubi` через ядро, а ядро видит раздел таким, каким его описывает
@@ -243,6 +288,10 @@ reboot
 | `openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-argon-ru-squashfs-sysupgrade.itb` | мой sysupgrade | `f98dceeb28b3a8446f1ff58a904794b502c9f21bc9d9a762197b7ceff0113a1f` |
 | `512m/netcore_n60-pro-512m-wildedition-bl2.bin` | BL2 WildEdition для NAND 512 МБ (сборка 31.12.2025), образ раздела 1 МБ | `9b958b6ff922f55aa20dcf81afc5052152c020a5b0fc9ca50d7fd246cd560388` |
 | `512m/netcore_n60-pro-512m-wildedition-fip.bin` | BL31 + U-Boot 2025.07-WildEdition (09.11.2025), образ раздела 2 МБ | `e4d87f39ebc01f5b5cf8428adc000cb327424f7b223622782bb876d1ebf34aed` |
+
+Отдельно в репозитории лежит [`tools/retarget-ubi.py`](tools/retarget-ubi.py) —
+правка размера раздела `ubi` в DTB готового образа без пересборки прошивки
+(см. [раскладки и DTS](#раскладка-u-boot-и-dts-прошивки-откуда-берётся-свободное-место)).
 
 Официальные файлы побайтно совпадают с [downloads.openwrt.org](https://downloads.openwrt.org/releases/25.12.5/targets/mediatek/filogic/). Суммы лежат в [`firmware/SHA256SUMS`](firmware/SHA256SUMS) и [`firmware/512m/SHA256SUMS`](firmware/512m/SHA256SUMS).
 

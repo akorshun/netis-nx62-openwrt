@@ -18,6 +18,17 @@ jobs:
       - name: shellcheck
         run: shellcheck flash.sh flash-512m.sh tests/run.sh
 
+      - name: retarget-ubi.py меняет размер ubi и сохраняет структуру FIT
+        run: |
+          src=firmware/openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-argon-ru-squashfs-sysupgrade.itb
+          python3 tools/retarget-ubi.py "$src" /tmp/ubi500.itb 512000 | tee /tmp/retarget.log
+          grep -q '512000 КБ' /tmp/retarget.log
+          grep -q '(crc32): OK' /tmp/retarget.log
+          grep -q '(sha1): OK' /tmp/retarget.log
+          test "$(stat -c %s "$src")" = "$(stat -c %s /tmp/ubi500.itb)"
+          # различий должно быть немного: reg плюс два хеша
+          test "$(cmp -l "$src" /tmp/ubi500.itb | wc -l)" -le 32
+
       - name: Scenarios (dash + coreutils)
         run: sh tests/run.sh
 
