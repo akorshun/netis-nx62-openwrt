@@ -374,11 +374,26 @@ function Get-PcFile([string]$Name, [string]$Url, [string]$Sha) {
 	$path
 }
 
+# Часы роутера без NTP отстают на недели, и HTTPS (wget, opkg) отвергает
+# сертификаты как «not yet valid». Ставим время с ПК, если разница больше 5 минут.
+function Sync-RouterClock($r) {
+	$pc = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+	$res = Invoke-Router $r.Ip 'date -u +%s'
+	$router = 0
+	if (-not [long]::TryParse($res.Out.Trim(), [ref]$router)) { return }
+	if ([Math]::Abs($pc - $router) -le 300) { return }
+	$now = [DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss')
+	$set = Invoke-Router $r.Ip "date -u -s '$now' >/dev/null"
+	$was = [DateTimeOffset]::FromUnixTimeSeconds($router).UtcDateTime.ToString('yyyy-MM-dd HH:mm')
+	if ($set.Code -eq 0) { Ok "часы роутера: было $was UTC, поставлено время ПК" } else { Warn "не удалось поставить время на роутере (было $was UTC)" }
+}
+
 # Есть ли у роутера интернет. Если нет, flash.sh и образы загрузчика
 # передаются с ПК в /tmp/nx62-flash: flash.sh берёт их оттуда, не скачивая.
 function Initialize-Flash($r) {
 	Step 'Интернет на роутере'
 	Set-RouterPassword $r.Password
+	Sync-RouterClock $r
 	$t = Invoke-Router $r.Ip "wget -qO- $FlashUrl 2>/dev/null | head -c 9" -TimeoutSec 60
 	if ($t.Out -like '#!/bin/sh*') {
 		Ok 'есть, flash.sh запускается через wget … | sh'
