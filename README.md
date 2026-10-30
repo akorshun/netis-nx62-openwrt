@@ -59,7 +59,7 @@ OpenSSH. ПК подключается кабелем в LAN роутера, р�
 в одну папку и запустите `flash-windows.cmd` двойным щелчком, или из PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .lash-windows.ps1
+powershell -ExecutionPolicy Bypass -File .\flash-windows.ps1
 ```
 
 Скрипт:
@@ -87,7 +87,7 @@ powershell -ExecutionPolicy Bypass -File .lash-windows.ps1
 | --- | --- |
 | `-Ip 192.168.10.1` | искать роутер на других адресах (через запятую) |
 | `-Password secret` | пароль root, пробуется первым |
-| `-Firmware D:ile.itb` | залить свой sysupgrade-образ |
+| `-Firmware D:\file.itb` | залить свой sysupgrade-образ |
 | `-Recovery` | `flash.sh -r`: initramfs остаётся в NAND аварийным томом |
 | `-FullBackup` | добавить в бэкап все разделы целиком, включая `ubi` (около 120 МБ) |
 | `-Yes` | не спрашивать подтверждения |
