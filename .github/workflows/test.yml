@@ -63,3 +63,25 @@ jobs:
         with:
           name: initramfs-ubi
           path: tests/out-initramfs.ubi
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: flash-windows.ps1 parses in Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $e = $null; $t = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\flash-windows.ps1", [ref]$t, [ref]$e)
+          if ($e) { $e | ForEach-Object { $_.ToString() }; exit 1 }
+          $b = [IO.File]::ReadAllBytes("$PWD\flash-windows.ps1")
+          if ($b[0] -ne 0xEF -or $b[1] -ne 0xBB -or $b[2] -ne 0xBF) { 'no UTF-8 BOM: Cyrillic breaks in PowerShell 5.1'; exit 1 }
+
+      - name: no router found exits 1 and cleans up
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\flash-windows.ps1 -Ip 127.0.0.1,127.0.0.2 -Yes
+          if ($LASTEXITCODE -ne 1) { "exit code $LASTEXITCODE"; exit 1 }
+          if (Get-ChildItem $env:TEMP -Filter 'nx62-askpass-*') { 'askpass file left behind'; exit 1 }
+          exit 0

@@ -2,3 +2,4 @@
 *.bin binary
 *.fip binary
 *.itb binary
+*.cmd text eol=crlf

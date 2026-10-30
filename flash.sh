@@ -14,6 +14,9 @@
 #   wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash.sh | sh
 #   wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash.sh | sh -s -- -y -r
 #
+# С -b скрипт только проверяет роутер, скачивает образы и снимает бэкап в
+# /tmp/nx62-flash/backup, ничего не записывая: так его забирает flash-windows.ps1.
+#
 # https://github.com/akorshun/netis-nx62-openwrt
 
 REPO_URL="https://github.com/akorshun/netis-nx62-openwrt"
@@ -43,6 +46,7 @@ WORKDIR="${NX62_WORKDIR:-/tmp/nx62-flash}"
 UBI_IMAGE="$WORKDIR/initramfs.ubi"
 
 AUTO_YES=0
+BACKUP_ONLY=0
 KEEP_RECOVERY=0
 NEED_UBI_UTILS=0
 NEED_BL2=1
@@ -477,8 +481,10 @@ next_steps() {
 
 usage() {
 	cat <<-EOF
-		Использование: flash.sh [-y] [-r]
+		Использование: flash.sh [-y] [-r] [-b]
 		  -y, --yes        не задавать вопросов
+		  -b, --backup-only  только проверить роутер и снять бэкап в
+		                   $WORKDIR/backup, ничего не записывая
 		  -r, --recovery   оставить initramfs в NAND отдельным томом recovery
 		                   как аварийный (около 9 МБ)
 		Подробно: $REPO_URL
@@ -494,6 +500,9 @@ main() {
 		-r|--recovery)
 			KEEP_RECOVERY=1
 			BOOT_VOL=recovery
+			;;
+		-b|--backup-only)
+			BACKUP_ONLY=1
 			;;
 		-h|--help)
 			usage
@@ -523,6 +532,13 @@ main() {
 	backup_parts
 	part_matches bl2 "$WORKDIR/$BL2_FILE" "$BL2_SHA256" && NEED_BL2=0
 	part_matches fip "$WORKDIR/$FIP_FILE" "$FIP_SHA256" && NEED_FIP=0
+
+	if [ "$BACKUP_ONLY" = 1 ]; then
+		echo
+		ok "Бэкап готов, на роутере ничего не записано (-b)."
+		echo "  Забрать на ПК: scp -O -r root@$(router_ip):$WORKDIR/backup ."
+		exit 0
+	fi
 
 	summary
 	confirm "Продолжить?"

@@ -42,6 +42,59 @@ wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/fla
 wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash.sh | sh -s -- -y
 ```
 
+Только проверка и бэкап в `/tmp/nx62-flash/backup`, без записи:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash.sh | sh -s -- -b
+```
+
+### С компьютера на Windows: от начала до проверки
+
+[`flash-windows.ps1`](flash-windows.ps1) делает всё сам, от входа на роутер до
+проверки установленной прошивки. Нужен только встроенный в Windows 10/11 клиент
+OpenSSH. ПК подключается кабелем в LAN роутера, роутеру нужен интернет на WAN.
+
+Скачайте [`flash-windows.ps1`](https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash-windows.ps1)
+и [`flash-windows.cmd`](https://raw.githubusercontent.com/akorshun/netis-nx62-openwrt/main/flash-windows.cmd)
+в одну папку и запустите `flash-windows.cmd` двойным щелчком, или из PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .lash-windows.ps1
+```
+
+Скрипт:
+
+1. ищет роутер по SSH на `192.168.2.1`, `192.168.20.1`, `192.168.1.1` и `192.168.0.1`,
+   без пароля и с распространёнными паролями (`root`, `password`, `passwd`, `toor`,
+   `admin`, `12345678` и др.), и проверяет, что это NX62 / N60 Pro;
+2. запускает `flash.sh -b`: проверка роутера и бэкап без записи. Бэкап копируется
+   на ПК в `backup\<дата_время>` рядом со скриптом и сверяется по SHA-256;
+3. после подтверждения запускает `flash.sh -y` и ждёт initramfs на `192.168.1.1`;
+4. заливает sysupgrade-образ. Сначала берётся `-Firmware` или файл
+   `openwrt-25.12.5-…-argon-ru-squashfs-sysupgrade.itb` рядом со скриптом
+   (по `scp -O`). Если файла нет, роутер качает его из репозитория сам, а если
+   у роутера нет интернета, образ качает ПК. SHA-256 сверяется с `firmware/SHA256SUMS`,
+   затем `sysupgrade -T` и `sysupgrade -n`;
+5. ждёт прошивку на `192.168.0.1` или `192.168.1.1` и проверяет: корень на
+   overlay, `/rom` squashfs, `/overlay` на UBIFS, `bl2` и `fip` совпадают с
+   официальным загрузчиком, тома `ubootenv`, `ubootenv2`, `fit`, `rootfs_data`
+   на месте, bad-блоки и ошибки UBI в `dmesg`. Выводит свободное место в overlay.
+
+Если роутер уже в initramfs 25.12.5 с официальным загрузчиком (например,
+повторный запуск после обрыва), скрипт сразу переходит к шагу 4.
+
+| Ключ | Что делает |
+| --- | --- |
+| `-Ip 192.168.10.1` | искать роутер на других адресах (через запятую) |
+| `-Password secret` | пароль root, пробуется первым |
+| `-Firmware D:ile.itb` | залить свой sysupgrade-образ |
+| `-Recovery` | `flash.sh -r`: initramfs остаётся в NAND аварийным томом |
+| `-FullBackup` | добавить в бэкап все разделы целиком, включая `ubi` (около 120 МБ) |
+| `-Yes` | не спрашивать подтверждения |
+
+Версию с 512 МБ ROM скрипт не прошивает: `flash.sh` остановится на проверке и
+подскажет `flash-512m.sh`.
+
 ### Что нужно
 
 - роутер на OpenWrt 25.12 с разметкой официальной сборки `netcore_n60-pro`: официальный образ или собранный на его основе;
