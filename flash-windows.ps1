@@ -50,7 +50,18 @@ $FwName = 'openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-argon-ru-squashfs-sy
 $FwUrl = "$RepoRaw/firmware/$FwName"
 $SumsUrl = "$RepoRaw/firmware/SHA256SUMS"
 $RouterFw = '/tmp/sysupgrade.itb'
-$RouterBackup = '/tmp/nx62-flash/backup'
+$RouterWork = '/tmp/nx62-flash'
+$RouterBackup = "$RouterWork/backup"
+# Образы, которые flash.sh берёт из $RouterWork, если они уже там
+$KitFiles = @(
+	'openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-preloader.bin',
+	'openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-bl31-uboot.fip',
+	'openwrt-25.12.5-mediatek-filogic-netcore_n60-pro-initramfs-recovery.itb'
+)
+$KitDir = Join-Path $PSScriptRoot 'firmware'
+# Как запускать flash.sh: wget … | sh, а без интернета на роутере — копия с ПК
+$script:FlashCmd = "wget -qO- $FlashUrl | sh -s --"
+$script:RouterOnline = $true
 
 # Официальный загрузчик 25.12.5, который пишет flash.sh: размер и SHA-256
 $Bl2Size = 209931
@@ -175,6 +186,8 @@ echo "lan=$(uci -q get network.lan.ipaddr)"
 b=$(idx bl2); f=$(idx fip)
 [ -n "$b" ] && echo "bl2sha=$(head -c @BL2SIZE@ /dev/mtd$b | sha256sum | cut -d ' ' -f 1)"
 [ -n "$f" ] && echo "fipsha=$(head -c @FIPSIZE@ /dev/mtd$f | sha256sum | cut -d ' ' -f 1)"
+[ -n "$b" ] && echo "bl2flags=$(cat /sys/class/mtd/mtd$b/flags 2>/dev/null)"
+if grep -q '^mtd_rw ' /proc/modules 2>/dev/null || [ -n "$(find /lib/modules -name mtd-rw.ko 2>/dev/null)" ]; then echo "mtdrw=1"; fi
 sed -n 's/^mtd\([0-9]*\): \([0-9a-f]*\) [0-9a-f]* "\(.*\)"$/\1 \2 \3/p' /proc/mtd | while read -r n size name; do
 	echo "mtd=$name $(( 0x$size / 1024 )) $(cat /sys/class/mtd/mtd$n/bad_blocks 2>/dev/null)"
 done
@@ -220,6 +233,13 @@ function Test-Initramfs($probe) {
 
 function Test-Loader($probe) {
 	(Get-One $probe 'bl2sha') -eq $Bl2Sha -and (Get-One $probe 'fipsha') -eq $FipSha
+}
+
+# Может ли flash.sh писать bl2/fip без установки kmod-mtd-rw из интернета
+function Test-MtdWritable($probe) {
+	$flags = Get-One $probe 'bl2flags'
+	if ((Get-One $probe 'mtdrw') -eq '1') { return $true }
+	$flags -match '^0x[0-9a-f]+$' -and (([Convert]::ToInt32($flags.Substring(2), 16) -band 0x400) -ne 0)
 }
 
 function Show-Router($address, $probe) {
@@ -315,10 +335,77 @@ function Find-Router {
 	Fail "Netis NX62 / Netcore N60 Pro не найден на $($Ip -join ', '). Подключите ПК кабелем в LAN, проверьте адрес и пароль (-Ip, -Password)."
 }
 
+# SHA-256 файлов из firmware/SHA256SUMS репозитория, иначе из локальной копии
+function Get-RepoSums {
+	$h = @{}
+	$t = $null
+	try {
+		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+		$t = (Invoke-WebRequest -UseBasicParsing -Uri $SumsUrl -TimeoutSec 30).Content
+		if ($t -is [byte[]]) { $t = [Text.Encoding]::ASCII.GetString($t) }
+	} catch {
+		$local = Join-Path $KitDir 'SHA256SUMS'
+		if (Test-Path $local) { $t = [IO.File]::ReadAllText($local) }
+	}
+	foreach ($line in ($t -split "`n")) {
+		if ($line -match '^([0-9a-f]{64})\s+\*?(\S+)\s*$') { $h[$Matches[2]] = $Matches[1] }
+	}
+	$h
+}
+
+# Файл на ПК: из папки firmware, если он там и SHA-256 сходится, иначе скачать
+function Get-PcFile([string]$Name, [string]$Url, [string]$Sha) {
+	New-Item -ItemType Directory -Force $KitDir | Out-Null
+	$path = Join-Path $KitDir $Name
+	if ((Test-Path $path) -and (-not $Sha -or (Get-FileHash $path -Algorithm SHA256).Hash.ToLower() -eq $Sha)) {
+		return $path
+	}
+	try {
+		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+		Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile "$path.part" -TimeoutSec 600
+	} catch {
+		Fail "не удалось скачать на ПК $Url"
+	}
+	if ($Sha -and (Get-FileHash "$path.part" -Algorithm SHA256).Hash.ToLower() -ne $Sha) {
+		Remove-Item "$path.part"
+		Fail "SHA-256 не совпадает: $Name"
+	}
+	Move-Item -Force "$path.part" $path
+	$path
+}
+
+# Есть ли у роутера интернет. Если нет, flash.sh и образы загрузчика
+# передаются с ПК в /tmp/nx62-flash: flash.sh берёт их оттуда, не скачивая.
+function Initialize-Flash($r) {
+	Step 'Интернет на роутере'
+	Set-RouterPassword $r.Password
+	$t = Invoke-Router $r.Ip "wget -qO- $FlashUrl 2>/dev/null | head -c 9" -TimeoutSec 60
+	if ($t.Out -like '#!/bin/sh*') {
+		Ok 'есть, flash.sh запускается через wget … | sh'
+		return
+	}
+
+	$script:RouterOnline = $false
+	Warn 'у роутера нет интернета (WAN не подключён или не работает DNS)'
+	Note 'flash.sh и образы загрузчика передаю с ПК'
+	$sums = Get-RepoSums
+	$files = @(Get-PcFile 'flash.sh' $FlashUrl $null)
+	foreach ($f in $KitFiles) { $files += Get-PcFile $f "$RepoRaw/firmware/$f" $sums[$f] }
+	$res = Invoke-Router $r.Ip "mkdir -p $RouterWork"
+	if ($res.Code -ne 0) { Fail "не удалось создать $RouterWork на роутере" }
+	& $Scp -O @SshOpts @files "root@$($r.Ip):$RouterWork/" | Out-Host
+	if ($LASTEXITCODE -ne 0) { Fail 'scp не скопировал файлы на роутер' }
+	$script:FlashCmd = "sh $RouterWork/flash.sh"
+	Ok "flash.sh и образы в $RouterWork"
+}
+
 function Save-Backup($r) {
 	Step 'Бэкап (flash.sh -b)'
 	Set-RouterPassword $r.Password
-	$res = Invoke-RouterLive $r.Ip "wget -qO- $FlashUrl | sh -s -- -b"
+	$res = Invoke-RouterLive $r.Ip "$($script:FlashCmd) -b"
+	if ($res.Lines.Count -eq 0) {
+		Fail 'flash.sh ничего не вывел: скрипт не скачался или не запустился. На роутере ничего не записано.'
+	}
 	if (-not ($res.Lines -match 'Бэкап готов')) {
 		Fail 'flash.sh не снял бэкап (ошибка выше). На роутере ничего не записано.'
 	}
@@ -379,7 +466,7 @@ function Install-Loader($r) {
 	Set-RouterPassword $r.Password
 	$arg = '-y'
 	if ($Recovery) { $arg = '-y -r' }
-	$res = Invoke-RouterLive $r.Ip "wget -qO- $FlashUrl | sh -s -- $arg"
+	$res = Invoke-RouterLive $r.Ip "$($script:FlashCmd) $arg"
 	if (-not ($res.Lines -match 'Загрузчик OpenWrt 25.12.5 на месте')) {
 		Fail 'flash.sh остановился с ошибкой (выше). НЕ выключайте роутер, если он писал bl2/fip, — запустите скрипт ещё раз.'
 	}
@@ -399,15 +486,7 @@ function Find-LocalFirmware {
 }
 
 function Get-ExpectedSha {
-	try {
-		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-		$t = (Invoke-WebRequest -UseBasicParsing -Uri $SumsUrl -TimeoutSec 30).Content
-		if ($t -is [byte[]]) { $t = [Text.Encoding]::ASCII.GetString($t) }
-		foreach ($line in ($t -split "`n")) {
-			if ($line -match "^([0-9a-f]{64})\s+\*?$([regex]::Escape($FwName))\s*$") { return $Matches[1] }
-		}
-	} catch { }
-	$null
+	(Get-RepoSums)[$FwName]
 }
 
 function Get-RouterSha($r) {
@@ -431,13 +510,7 @@ function Send-Firmware($r) {
 			return
 		}
 		Warn 'роутер не скачал образ (нет интернета на WAN?), качаю на ПК'
-		$local = Join-Path $PSScriptRoot $FwName
-		try {
-			[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-			Invoke-WebRequest -UseBasicParsing -Uri $FwUrl -OutFile $local -TimeoutSec 600
-		} catch {
-			Fail "не удалось скачать $FwUrl. Положите файл $FwName рядом со скриптом."
-		}
+		$local = Get-PcFile $FwName $FwUrl $expected
 	}
 
 	$localSha = (Get-FileHash $local -Algorithm SHA256).Hash.ToLower()
@@ -545,6 +618,7 @@ try {
 	Write-Host $Repo
 
 	$r = Find-Router
+	Initialize-Flash $r
 	$backupDir = Save-Backup $r
 
 	# Уже в initramfs 25.12.5 с нашим загрузчиком (например, повторный запуск
@@ -552,6 +626,11 @@ try {
 	$inInitramfs = (Test-Initramfs $r.Probe) -and (Test-Loader $r.Probe)
 	$fwText = $FwName
 	if ($Firmware) { $fwText = $Firmware }
+
+	# bl2/fip закрыты от записи, а kmod-mtd-rw ставится только из интернета
+	if (-not $inInitramfs -and -not $script:RouterOnline -and -not (Test-MtdWritable $r.Probe)) {
+		Fail "бэкап снят ($backupDir), но прошить загрузчик нельзя: bl2 и fip у этой прошивки только для чтения, а kmod-mtd-rw ставится из интернета. Подключите WAN роутера к интернету (кабель в WAN, проверьте http://$($r.Ip)) и запустите скрипт ещё раз."
+	}
 
 	Step 'План'
 	if ($inInitramfs) {
